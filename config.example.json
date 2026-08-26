@@ -1,0 +1,15 @@
+{
+  "app_id": "wx44a67f9e199a46d0",
+  "shop_id": 4,
+  "proxy_port": 8888,
+  "loop_interval_hours": 5,
+  "smtp": {
+    "enabled": true,
+    "smtp_server": "smtp.qq.com",
+    "smtp_port": 465,
+    "use_ssl": true,
+    "sender_email": "your_email@qq.com",
+    "auth_code": "your_qq_smtp_authorization_code",
+    "receiver_email": "your_email@qq.com"
+  }
+}
