@@ -15,6 +15,7 @@ import asyncio
 import smtplib
 import subprocess
 import winreg
+import socket
 import ctypes
 import ctypes.wintypes
 from email.mime.text import MIMEText
@@ -75,12 +76,35 @@ http_client = requests.Session()
 http_client.trust_env = False
 http_client.verify = False
 
-# 日志输出配置
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
+# 独立日志记录器，避免与 mitmproxy 的 root handler 耦合
+app_logger = logging.getLogger("wechat_sign_app")
+app_logger.setLevel(logging.INFO)
+app_logger.propagate = False
+if not app_logger.handlers:
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    app_logger.addHandler(sh)
+
+# ======================= [端口检查与单实例保护] =======================
+def clean_port_conflict(port):
+    """检测端口是否被占用，若被占用则尝试安全释放"""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.5)
+            if s.connect_ex(('127.0.0.1', port)) == 0:
+                app_logger.warning(f"⚠️ 检测到端口 {port} 已被占用，正在查找并终止旧进程...")
+                cur_pid = os.getpid()
+                for conn in psutil.net_connections():
+                    if conn.laddr and conn.laddr.port == port and conn.pid and conn.pid != cur_pid:
+                        try:
+                            proc = psutil.Process(conn.pid)
+                            app_logger.info(f"终止占用端口 {port} 的旧进程: {proc.name()} (PID: {conn.pid})")
+                            proc.kill()
+                        except Exception:
+                            pass
+                time.sleep(1)
+    except Exception as e:
+        app_logger.error(f"端口冲突检测异常: {e}")
 
 # ======================= [Windows API / 结构体定义] =======================
 user32 = ctypes.windll.user32
@@ -110,17 +134,17 @@ def set_system_proxy(enable=True, host="127.0.0.1", port=8888):
         if enable:
             winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
             winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, f"{host}:{port}")
-            logging.info(f"🌐 Windows 系统代理已设置为: {host}:{port}")
+            app_logger.info(f"🌐 Windows 系统代理已设置为: {host}:{port}")
         else:
             winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
-            logging.info("🌐 Windows 系统代理已还原 (禁用)")
+            app_logger.info("🌐 Windows 系统代理已还原 (禁用)")
         winreg.CloseKey(key)
         
         internet_set_option = ctypes.windll.Wininet.InternetSetOptionW
         internet_set_option(0, INTERNET_OPTION_SETTINGS_CHANGED, 0, 0)
         internet_set_option(0, INTERNET_OPTION_REFRESH, 0, 0)
     except Exception as e:
-        logging.error(f"设置系统代理异常: {e}")
+        app_logger.error(f"设置系统代理异常: {e}")
 
 def get_main_wechat_windows():
     """高精度定位所有运行中微信实例的主聊天窗口 (过滤托盘及辅助子窗口)"""
@@ -190,18 +214,18 @@ def activate_and_open_miniapp(hwnd, pid, index):
         # 非阻塞拉起小程序协议
         subprocess.Popen(f"start weixin://miniapp/{APP_ID}", shell=True)
         subprocess.Popen(f"start wechat://miniapp/{APP_ID}", shell=True)
-        logging.info(f"📱 已激活第 {index} 个微信 (HWND: {hwnd}, PID: {pid}) 并拉起小程序，等待 5 秒响应...")
+        app_logger.info(f"📱 已激活第 {index} 个微信 (HWND: {hwnd}, PID: {pid}) 并拉起小程序，等待 5 秒响应...")
         time.sleep(5)
     except Exception as e:
-        logging.error(f"激活微信窗口失败: {e}")
+        app_logger.error(f"激活微信窗口失败: {e}")
 
 def trigger_dual_wechat_relogin():
     """遍历所有微信多开实例依次唤醒并抓包"""
     windows_map = get_main_wechat_windows()
     if not windows_map:
-        logging.error("❌ 未检测到运行中的微信主窗口，请确保微信多开正常挂在后台！")
+        app_logger.error("❌ 未检测到运行中的微信主窗口，请确保微信多开正常挂在后台！")
         return False
-    logging.info(f"🔍 找到 {len(windows_map)} 个微信主窗口实例，开始依次唤醒...")
+    app_logger.info(f"🔍 找到 {len(windows_map)} 个微信主窗口实例，开始依次唤醒...")
     for idx, (pid, info) in enumerate(windows_map.items(), start=1):
         activate_and_open_miniapp(info['hwnd'], pid, idx)
     return True
@@ -286,14 +310,14 @@ def send_email_report(account_index, nickname, mobile, success, status_desc, pri
             server.login(SMTP_CONFIG["sender_email"], SMTP_CONFIG["auth_code"])
             server.sendmail(SMTP_CONFIG["sender_email"], [SMTP_CONFIG["receiver_email"]], msg.as_string())
             server.quit()
-            logging.info(f"📧 [邮件已发送] 账号 {account_index}({nickname}) 结果已送达 {SMTP_CONFIG['receiver_email']}")
+            app_logger.info(f"📧 [邮件已发送] 账号 {account_index}({nickname}) 结果已送达 {SMTP_CONFIG['receiver_email']}")
             return True
         except Exception as e:
-            logging.warning(f"⚠️ 发送邮件第 {attempt}/{MAX_NETWORK_RETRIES} 次尝试失败: {e}")
+            app_logger.warning(f"⚠️ 发送邮件第 {attempt}/{MAX_NETWORK_RETRIES} 次尝试失败: {e}")
             if attempt < MAX_NETWORK_RETRIES:
                 time.sleep(2)
             else:
-                logging.error(f"❌ 邮件发送最终失败: {e}")
+                app_logger.error(f"❌ 邮件发送最终失败: {e}")
     return False
 
 # ======================= [2. 账号数据持久化与多源同步] =======================
@@ -370,7 +394,7 @@ def save_account(user_data, acc_key=None):
         except Exception:
             pass
             
-    logging.info(f"🎉 [数据持久化] 成功保存账号 [{db[key]['nickname']} ({db[key]['mobile']})] 最新 Token 数据！")
+    app_logger.info(f"🎉 [数据持久化] 成功保存账号 [{db[key]['nickname']} ({db[key]['mobile']})] 最新 Token 数据！")
 
 def fetch_user_info_and_save(token):
     """通过 Token 查询用户信息并保存 (带重试机制)"""
@@ -423,7 +447,7 @@ class MiniAppInterceptor:
                 if res.get("code") == 200 and "data" in res:
                     save_account(res["data"])
             except Exception as e:
-                logging.error(f"解析登录响应失败: {e}")
+                app_logger.error(f"解析登录响应失败: {e}")
         # 拦截 token refresh 响应
         elif "mongoose.liangjingkeji.com/token/refresh" in flow.request.pretty_url:
             try:
@@ -437,15 +461,16 @@ async def _run_proxy_async(port):
     opts = options.Options(listen_host="127.0.0.1", listen_port=port, ssl_insecure=True)
     master = DumpMaster(opts, with_termlog=False, with_dumper=False)
     master.addons.add(MiniAppInterceptor())
-    logging.info(f"✅ 内嵌抓包代理服务已就绪 (监听端口: {port})")
+    app_logger.info(f"✅ 内嵌抓包代理服务已就绪 (监听端口: {port})")
     await master.run()
 
 def start_embedded_proxy():
+    clean_port_conflict(PROXY_PORT)
     set_system_proxy(enable=True, host="127.0.0.1", port=PROXY_PORT)
     try:
         asyncio.run(_run_proxy_async(PROXY_PORT))
     except Exception as e:
-        logging.error(f"代理运行异常: {e}")
+        app_logger.error(f"代理运行异常: {e}")
 
 # ======================= [4. 业务请求与自动签到 (带智能响应解析 & 当日上限停签)] =======================
 def test_token_valid(token):
@@ -468,7 +493,7 @@ def test_token_valid(token):
             elif r.status_code in [401, 403]:
                 return False
         except Exception as e:
-            logging.warning(f"⚠️ 测试 Token 接口第 {attempt}/{MAX_NETWORK_RETRIES} 次网络异常: {e}")
+            app_logger.warning(f"⚠️ 测试 Token 接口第 {attempt}/{MAX_NETWORK_RETRIES} 次网络异常: {e}")
             if attempt < MAX_NETWORK_RETRIES:
                 time.sleep(2)
     return False
@@ -492,13 +517,13 @@ def try_refresh_token(refresh_token):
                 if res.get("code") == 200 and "data" in res:
                     return res["data"]
                 else:
-                    logging.warning(f"⚠️ 刷新 Token 服务端响应: {res.get('msg')}")
+                    app_logger.warning(f"⚠️ 刷新 Token 服务端响应: {res.get('msg')}")
                     return None
             elif r.status_code in [401, 403, 409]:
-                logging.warning(f"⚠️ RefreshToken 已在服务端失效 (状态码 {r.status_code})")
+                app_logger.warning(f"⚠️ RefreshToken 已在服务端失效 (状态码 {r.status_code})")
                 return None
         except Exception as e:
-            logging.warning(f"⚠️ 刷新 Token 第 {attempt}/{MAX_NETWORK_RETRIES} 次网络超时/重试: {e}")
+            app_logger.warning(f"⚠️ 刷新 Token 第 {attempt}/{MAX_NETWORK_RETRIES} 次网络超时/重试: {e}")
             if attempt < MAX_NETWORK_RETRIES:
                 time.sleep(2)
     return None
@@ -518,7 +543,7 @@ def play_turntable(token):
             resp = http_client.post(url, data={"shopId": SHOP_ID}, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
             return resp.json()
         except Exception as e:
-            logging.warning(f"⚠️ 转盘抽奖第 {attempt}/{MAX_NETWORK_RETRIES} 次网络异常: {e}")
+            app_logger.warning(f"⚠️ 转盘抽奖第 {attempt}/{MAX_NETWORK_RETRIES} 次网络异常: {e}")
             if attempt < MAX_NETWORK_RETRIES:
                 time.sleep(2)
             else:
@@ -556,7 +581,7 @@ def parse_prize_info(result):
     return False, "⚠️ 签到未成功", "未获取到奖励", msg if msg else str(result), False
 
 def run_sign_workflow(round_count):
-    logging.info(f"================ 开始执行第 {round_count} 轮双账号转盘签到 ================")
+    app_logger.info(f"================ 开始执行第 {round_count} 轮双账号转盘签到 ================")
     accounts = load_accounts()
     today_str = time.strftime("%Y-%m-%d")
     
@@ -569,16 +594,16 @@ def run_sign_workflow(round_count):
             
         token = info.get("token")
         if not test_token_valid(token):
-            logging.warning(f"⚠️ 账号 [{info.get('nickname', acc_key)}] Token 无效，尝试静默刷新...")
+            app_logger.warning(f"⚠️ 账号 [{info.get('nickname', acc_key)}] Token 无效，尝试静默刷新...")
             refreshed_data = try_refresh_token(info.get("refreshToken"))
             if refreshed_data and refreshed_data.get("token"):
                 info["token"] = refreshed_data.get("token")
                 if refreshed_data.get("refreshToken"):
                     info["refreshToken"] = refreshed_data.get("refreshToken")
                 save_account(info, acc_key=acc_key)
-                logging.info(f"✅ 账号 [{info.get('nickname', acc_key)}] 静默刷新 Token 成功！")
+                app_logger.info(f"✅ 账号 [{info.get('nickname', acc_key)}] 静默刷新 Token 成功！")
             else:
-                logging.warning(f"⚠️ 账号 [{info.get('nickname', acc_key)}] 静默刷新失败，需拉起微信重登！")
+                app_logger.warning(f"⚠️ 账号 [{info.get('nickname', acc_key)}] 静默刷新失败，需拉起微信重登！")
                 need_relogin = True
 
     if len(accounts) < 2:
@@ -591,7 +616,7 @@ def run_sign_workflow(round_count):
         accounts = load_accounts()
 
     if not accounts:
-        logging.error("❌ 未能获取到任何有效账号，本次签到跳过。")
+        app_logger.error("❌ 未能获取到任何有效账号，本次签到跳过。")
         return
 
     # 遍历每个账号执行签到并独立发信
@@ -602,23 +627,23 @@ def run_sign_workflow(round_count):
         
         # 检查该账号今天是否已经完成全部抽奖
         if info.get("daily_completed_date") == today_str:
-            logging.info(f"⏭️ 账号 {idx} [{nickname}] 今日抽奖次数已用完，跳过本日后续执行。")
+            app_logger.info(f"⏭️ 账号 {idx} [{nickname}] 今日抽奖次数已用完，跳过本日后续执行。")
             continue
             
         if not token:
-            logging.warning(f"⚠️ 账号 {idx} [{nickname}] 缺少 Token，跳过签到。")
+            app_logger.warning(f"⚠️ 账号 {idx} [{nickname}] 缺少 Token，跳过签到。")
             continue
             
-        logging.info(f"🎯 正在为账号 {idx} [{nickname} ({mobile})] 执行转盘抽奖...")
+        app_logger.info(f"🎯 正在为账号 {idx} [{nickname} ({mobile})] 执行转盘抽奖...")
         result = play_turntable(token)
         success, status_desc, prize_desc, raw_msg, is_daily_finished = parse_prize_info(result)
-        logging.info(f"[{nickname}] 转盘结果: {status_desc} | {prize_desc} | 原始响应: {raw_msg}")
+        app_logger.info(f"[{nickname}] 转盘结果: {status_desc} | {prize_desc} | 原始响应: {raw_msg}")
         
         # 如果当天次数用完，记录完成日期以停止今天后续的请求
         if is_daily_finished:
             info["daily_completed_date"] = today_str
             save_account(info, acc_key=acc_key)
-            logging.info(f"📌 账号 {idx} [{nickname}] 已标记为本日完成，今天内不再重复请求。")
+            app_logger.info(f"📌 账号 {idx} [{nickname}] 已标记为本日完成，今天内不再重复请求。")
 
         # 触发该账号独立的邮件发送
         send_email_report(
@@ -632,7 +657,7 @@ def run_sign_workflow(round_count):
         )
         time.sleep(1)
         
-    logging.info(f"================ 第 {round_count} 轮签到任务执行完毕 ================")
+    app_logger.info(f"================ 第 {round_count} 轮签到任务执行完毕 ================")
 
 # ======================= [5. 程序主入口 & 定时调度] =======================
 def main():
@@ -654,12 +679,12 @@ def main():
                 run_sign_workflow(round_idx)
                 round_idx += 1
             except Exception as e:
-                logging.error(f"调度运行发生异常: {e}")
+                app_logger.error(f"调度运行发生异常: {e}")
             next_run = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(time.time() + LOOP_INTERVAL_SECONDS))
-            logging.info(f"⏳ 正在休眠等待 5 小时... 下一次签到将于 [{next_run}] 执行。")
+            app_logger.info(f"⏳ 正在休眠等待 5 小时... 下一次签到将于 [{next_run}] 执行。")
             time.sleep(LOOP_INTERVAL_SECONDS)
     except KeyboardInterrupt:
-        logging.info("程序收到退出信号，正在清理退出...")
+        app_logger.info("程序收到退出信号，正在清理退出...")
     finally:
         set_system_proxy(enable=False)
 
