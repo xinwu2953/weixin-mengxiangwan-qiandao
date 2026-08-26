@@ -195,8 +195,16 @@ def get_main_wechat_windows():
     user32.EnumWindows(cb, 0)
     return pid_windows
 
+def click_screen(x, y):
+    user32.SetCursorPos(int(x), int(y))
+    time.sleep(0.1)
+    user32.mouse_event(0x0002, 0, 0, 0, 0)
+    time.sleep(0.08)
+    user32.mouse_event(0x0004, 0, 0, 0, 0)
+    time.sleep(0.1)
+
 def activate_and_open_miniapp(hwnd, pid, index):
-    """激活指定微信主窗口并拉起小程序"""
+    """激活指定微信主窗口并通过原生界面搜索打开小程序 (无任何Windows协议弹窗)"""
     try:
         cur_thread = kernel32.GetCurrentThreadId()
         target_thread = user32.GetWindowThreadProcessId(hwnd, None)
@@ -210,12 +218,32 @@ def activate_and_open_miniapp(hwnd, pid, index):
         if cur_thread != target_thread and target_thread != 0:
             user32.AttachThreadInput(cur_thread, target_thread, False)
         
+        time.sleep(0.8)
+        r = ctypes.wintypes.RECT()
+        user32.GetWindowRect(hwnd, ctypes.byref(r))
+        
+        app_logger.info(f"📱 正在为第 {index} 个微信 (HWND: {hwnd}, PID: {pid}) 搜索拉起'梦享玩'小程序...")
+        # 点击搜索框
+        click_screen(r.left + 200, r.top + 35)
         time.sleep(0.5)
-        # 非阻塞拉起小程序协议
-        subprocess.Popen(f"start weixin://miniapp/{APP_ID}", shell=True)
-        subprocess.Popen(f"start wechat://miniapp/{APP_ID}", shell=True)
-        app_logger.info(f"📱 已激活第 {index} 个微信 (HWND: {hwnd}, PID: {pid}) 并拉起小程序，等待 5 秒响应...")
-        time.sleep(5)
+        
+        # 粘贴并回车
+        pyperclip.copy("梦享玩")
+        user32.keybd_event(0x11, 0, 0, 0) # Ctrl
+        user32.keybd_event(0x56, 0, 0, 0) # V
+        time.sleep(0.08)
+        user32.keybd_event(0x56, 0, 2, 0)
+        user32.keybd_event(0x11, 0, 2, 0)
+        time.sleep(1.0)
+        
+        user32.keybd_event(0x0D, 0, 0, 0) # Enter
+        time.sleep(0.08)
+        user32.keybd_event(0x0D, 0, 2, 0)
+        time.sleep(1.5)
+        
+        # 点击首个搜索结果
+        click_screen(r.left + 200, r.top + 100)
+        time.sleep(3)
     except Exception as e:
         app_logger.error(f"激活微信窗口失败: {e}")
 
@@ -225,9 +253,10 @@ def trigger_dual_wechat_relogin():
     if not windows_map:
         app_logger.error("❌ 未检测到运行中的微信主窗口，请确保微信多开正常挂在后台！")
         return False
-    app_logger.info(f"🔍 找到 {len(windows_map)} 个微信主窗口实例，开始依次唤醒...")
+    app_logger.info(f"🔍 找到 {len(windows_map)} 个微信主窗口实例，开始依次自愈拉起...")
     for idx, (pid, info) in enumerate(windows_map.items(), start=1):
         activate_and_open_miniapp(info['hwnd'], pid, idx)
+        time.sleep(2)
     return True
 
 # ======================= [1. 邮件发送模块 (带多轮重试 & 智能排版)] =======================
@@ -458,7 +487,12 @@ class MiniAppInterceptor:
                 pass
 
 async def _run_proxy_async(port):
-    opts = options.Options(listen_host="127.0.0.1", listen_port=port, ssl_insecure=True)
+    opts = options.Options(
+        listen_host="127.0.0.1",
+        listen_port=port,
+        ssl_insecure=True,
+        ignore_hosts=[r"^(?!.*mongoose\.liangjingkeji\.com).*"]
+    )
     master = DumpMaster(opts, with_termlog=False, with_dumper=False)
     master.addons.add(MiniAppInterceptor())
     app_logger.info(f"✅ 内嵌抓包代理服务已就绪 (监听端口: {port})")
@@ -612,7 +646,9 @@ def run_sign_workflow(round_count):
     # 触发自愈重登
     if need_relogin:
         trigger_dual_wechat_relogin()
-        time.sleep(2)
+        app_logger.info("⏳ 等待 15 秒供小程序加载并抓取最新 Token...")
+        for _ in range(15):
+            time.sleep(1)
         accounts = load_accounts()
 
     if not accounts:
@@ -636,6 +672,17 @@ def run_sign_workflow(round_count):
             
         app_logger.info(f"🎯 正在为账号 {idx} [{nickname} ({mobile})] 执行转盘抽奖...")
         result = play_turntable(token)
+        
+        # 如果抽奖返回“请登录后再操作”，触发就地自愈再重试一次
+        if result.get("code") in [401, 403] or "登录" in str(result.get("msg", "")):
+            app_logger.warning(f"⚠️ 账号 {idx} [{nickname}] 抽奖反馈需重新登录，立即触发窗口自愈重试...")
+            trigger_dual_wechat_relogin()
+            time.sleep(12)
+            fresh_accs = load_accounts()
+            if fresh_accs.get(acc_key, {}).get("token"):
+                token = fresh_accs[acc_key]["token"]
+                result = play_turntable(token)
+                
         success, status_desc, prize_desc, raw_msg, is_daily_finished = parse_prize_info(result)
         app_logger.info(f"[{nickname}] 转盘结果: {status_desc} | {prize_desc} | 原始响应: {raw_msg}")
         
