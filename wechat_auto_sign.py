@@ -52,7 +52,8 @@ LOOP_INTERVAL_SECONDS = 5 * 3600      # 循环周期：每 5 小时执行一次 
 MAX_NETWORK_RETRIES = 3               # 网络请求最大重试次数
 REQUEST_TIMEOUT_SECONDS = 15          # 网络请求超时时间 (秒)
 
-# 外部兼容路径
+# 外部兼容路径与安装配置
+WECHAT_INSTALL_PATH = r"d:\weixin\4.1.0.34\Weixin.exe"
 EXTERNAL_TOKEN_FILES = {
     "weixin252121438": os.path.join(r"D:\python\weixin252121438", "token.json"),
     "weixin2": os.path.join(r"D:\python\weixin2", "token.json"),
