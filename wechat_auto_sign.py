@@ -378,6 +378,17 @@ def trigger_dual_wechat_relogin(target_acc_key=None):
         app_logger.info(f"⏳ 正在为账号 {idx} [{acc_key}] 监控最新 Token (最多等待 15 秒)...")
         for _ in range(15):
             time.sleep(1)
+            # 1. 优先扫描进程内存直接提取有效 Token
+            try:
+                mem_tokens = scan_memory_for_valid_tokens()
+                if mem_tokens:
+                    save_account({"token": mem_tokens[0]}, acc_key=acc_key)
+                    app_logger.info(f"✅ 账号 {idx} [{acc_key}] 从内存成功捕获有效 Token！")
+                    break
+            except Exception:
+                pass
+                
+            # 2. 检查代理拦截或外部更新的 Token
             accs = load_accounts()
             cur_tok = accs.get(acc_key, {}).get("token")
             if test_token_valid(cur_tok):
@@ -592,6 +603,49 @@ def handle_intercepted_token(token, refresh_token=None):
         "refreshToken": refresh_token
     })
 
+def scan_memory_for_valid_tokens():
+    """直接扫描微信及小程序内存空间中的有效 JWT Token，无需依赖代理与网络驱动"""
+    found_tokens = []
+    for p in psutil.process_iter(['pid', 'name']):
+        name = (p.info['name'] or '').lower()
+        if 'wechatappex' in name or 'weixin' in name:
+            pid = p.info['pid']
+            h_proc = kernel32.OpenProcess(0x0010 | 0x0400, False, pid)
+            if not h_proc:
+                continue
+            mbi = (ctypes.c_void_p * 7)()
+            addr = 0
+            buf = ctypes.create_string_buffer(65536)
+            bread = ctypes.c_size_t()
+            while kernel32.VirtualQueryEx(h_proc, ctypes.c_void_p(addr), ctypes.byref(mbi), 48):
+                base = mbi[0] or 0
+                size = mbi[3] or 0
+                state = mbi[4] or 0
+                protect = mbi[5] or 0
+                if state == 0x1000 and (protect & 0x04):
+                    curr = base
+                    end = base + size
+                    while curr < end:
+                        chunk = min(65536, end - curr)
+                        if kernel32.ReadProcessMemory(h_proc, ctypes.c_void_p(curr), buf, chunk, ctypes.byref(bread)):
+                            data = buf.raw[:bread.value]
+                            if b'eyJhbGciOi' in data:
+                                matches = re.findall(rb'eyJhbGciOi[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+', data)
+                                for m in matches:
+                                    try:
+                                        cand = m.decode('utf-8')
+                                        if cand not in found_tokens:
+                                            if test_token_valid(cand):
+                                                found_tokens.append(cand)
+                                    except Exception:
+                                        pass
+                        curr += chunk
+                addr = base + size
+                if addr >= 0x7FFFFFFF0000:
+                    break
+            kernel32.CloseHandle(h_proc)
+    return found_tokens
+
 # ======================= [3. 内嵌 Mitmproxy 抓包代理服务] =======================
 from mitmproxy import http, options
 from mitmproxy.tools.dump import DumpMaster
@@ -626,19 +680,11 @@ class MiniAppInterceptor:
                 pass
 
 async def _run_proxy_async(port):
-    try:
-        opts = options.Options(
-            mode=[f"regular@{port}", "local:WeChatAppEx.exe", "local:Weixin.exe"],
-            listen_host="127.0.0.1",
-            listen_port=port,
-            ssl_insecure=True,
-        )
-    except Exception:
-        opts = options.Options(
-            listen_host="127.0.0.1",
-            listen_port=port,
-            ssl_insecure=True,
-        )
+    opts = options.Options(
+        listen_host="127.0.0.1",
+        listen_port=port,
+        ssl_insecure=True,
+    )
     master = DumpMaster(opts, with_termlog=False, with_dumper=False)
     master.addons.add(MiniAppInterceptor())
     app_logger.info(f"✅ 内嵌抓包代理服务已就绪 (监听端口: {port})")
