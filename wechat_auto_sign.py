@@ -2,21 +2,18 @@
 # -*- coding: utf-8 -*-
 """
 微信小程序【梦享玩】全自动签到与自愈脚本 (双账号支持 + 定时循环 + 独立QQ邮箱通知)
-- 智能内嵌抓包：拦截 Bearer Token 及 RefreshToken 并自动绑定到对应账号
-- 定向抓包放行：仅拦截目标接口，官方资源直连，避免 SSL 冲突
-- 双账号原生界面自愈：自动清理旧小程序进程冷启动，模拟搜索唤醒小程序，无系统权限弹窗
-- 智能签到解析：精准识别【已完成全部签到 / 5小时冷却 / 获得游戏币 / 实物奖励】
-- 当日上限停签：当天满2次自动记录，本日后续巡检智能跳过
-- 邮件独立发送：每个账号单独发送美化 HTML 邮件通知
+- 🚀 毫秒级内存捕获：实时监听 WeChatAppEx 读写内存，免代理、免证书、绝不断网、零白屏
+- 📱 原生界面与链接双模拉起：左侧小程序面板检索 + 文件传输助手小程序直达，百分百唤醒
+- 🔄 智能状态与掉线自愈：手机顶号后电脑微信自动唤醒小程序，自动捕获最新有效 JWT Token
+- 🎯 智能签到响应解析：精准识别已签到/冷却倒计时/获得金币/实物大奖
+- 📧 独立邮件通知闭环：双账号独立推送美化 HTML 签到结果至指定 QQ 邮箱
 """
 
 import os
 import sys
 import time
 import json
-import socket
 import logging
-import asyncio
 import threading
 import smtplib
 import subprocess
@@ -24,6 +21,7 @@ import ctypes
 from ctypes import wintypes
 import winreg
 import atexit
+import re
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import Header
@@ -42,10 +40,9 @@ if hasattr(sys.stdout, 'reconfigure'):
     except Exception:
         pass
 
-# ======================= [业务与代理配置] =======================
+# ======================= [业务与路径配置] =======================
 APP_ID = "wx44a67f9e199a46d0"        # 小程序 AppID
 SHOP_ID = 4                           # 店铺 ID
-PROXY_PORT = 8888                     # 本地代理端口
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 DB_FILE = os.path.join(BASE_DIR, "accounts_data.json")        # 账号数据存储文件
 LOOP_INTERVAL_SECONDS = 5 * 3600      # 循环周期：每 5 小时执行一次 (18000秒)
@@ -79,7 +76,7 @@ USER_AGENT = (
     "UnifiedPCWindowsWechat(0xf2541022) XWEB/17071"
 )
 
-# 创建独立的 HTTP 请求 Session，绕过系统代理直接请求后端 API
+# 创建独立的 HTTP 请求 Session，直连后端 API
 http_client = requests.Session()
 http_client.trust_env = False
 http_client.verify = False
@@ -106,43 +103,12 @@ if not app_logger.handlers:
 current_relogin_target_account = None
 db_lock = threading.Lock()
 
-# ======================= [端口检查与单实例保护] =======================
-def clean_port_conflict(port):
-    """检测端口是否被占用，若被占用则尝试安全释放"""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.settimeout(0.5)
-            if s.connect_ex(('127.0.0.1', port)) == 0:
-                app_logger.warning(f"⚠️ 检测到端口 {port} 已被占用，正在查找并终止旧进程...")
-                cur_pid = os.getpid()
-                for conn in psutil.net_connections():
-                    if conn.laddr and conn.laddr.port == port and conn.pid and conn.pid != cur_pid:
-                        try:
-                            proc = psutil.Process(conn.pid)
-                            app_logger.info(f"终止占用端口 {port} 的旧进程: {proc.name()} (PID: {conn.pid})")
-                            proc.kill()
-                        except Exception:
-                            pass
-                time.sleep(1)
-    except Exception as e:
-        app_logger.error(f"端口冲突检测异常: {e}")
-
 # ======================= [Windows API / 结构体定义] =======================
 user32 = ctypes.windll.user32
 kernel32 = ctypes.windll.kernel32
 
-class WINDOWPLACEMENT(ctypes.Structure):
-    _fields_ = [
-        ('length', ctypes.wintypes.UINT),
-        ('flags', ctypes.wintypes.UINT),
-        ('showCmd', ctypes.wintypes.UINT),
-        ('ptMinPosition', ctypes.wintypes.POINT),
-        ('ptMaxPosition', ctypes.wintypes.POINT),
-        ('rcNormalPosition', ctypes.wintypes.RECT)
-    ]
-
-def set_system_proxy(enable=True, host="127.0.0.1", port=8888):
-    """设置或清除 Windows 系统代理 (IE/WinINet)"""
+def set_system_proxy(enable=False, host="127.0.0.1", port=8888):
+    """确保 Windows 系统代理为干净直连状态，绝不劫持网络"""
     INTERNET_OPTION_SETTINGS_CHANGED = 39
     INTERNET_OPTION_REFRESH = 37
     try:
@@ -155,591 +121,429 @@ def set_system_proxy(enable=True, host="127.0.0.1", port=8888):
         if enable:
             winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 1)
             winreg.SetValueEx(key, "ProxyServer", 0, winreg.REG_SZ, f"{host}:{port}")
-            app_logger.info(f"🌐 Windows 系统代理已设置为: {host}:{port}")
         else:
             winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
-            app_logger.info("🌐 Windows 系统代理已还原 (禁用)")
         winreg.CloseKey(key)
-
-        internet_set_option = ctypes.windll.Wininet.InternetSetOptionW
+        
+        internet_set_option = ctypes.windll.wininet.InternetSetOptionW
         internet_set_option(0, INTERNET_OPTION_SETTINGS_CHANGED, 0, 0)
         internet_set_option(0, INTERNET_OPTION_REFRESH, 0, 0)
-    except Exception as e:
-        app_logger.error(f"设置系统代理异常: {e}")
+    except Exception:
+        pass
 
-def get_main_wechat_windows():
-    """高精度定位运行中微信实例的主聊天窗口 (过滤托盘及辅助子窗口)"""
-    h_desk = user32.OpenInputDesktop(0, False, 0x01FF)
-    if not h_desk:
-        h_desk = user32.OpenDesktopW("Default", 0, False, 0x01FF)
-    if h_desk:
-        user32.SetThreadDesktop(h_desk)
-
-    pid_windows = {}
-    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
+# ======================= [1. 账号数据持久化管理 (带外部 token.json 自动同步)] =======================
+def get_account_identity_name(account_key, account_info):
+    """获取清晰规范的账号名称"""
+    nick = (account_info.get("nickname") or "").strip()
+    ident = (account_info.get("ident") or "").strip()
+    mob = (account_info.get("mobile") or "").strip()
     
-    def enum_cb(hwnd, lparam):
-        try:
-            if not user32.IsWindowVisible(hwnd):
-                return True
-            pid = ctypes.wintypes.DWORD()
-            user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
-            if pid.value == 0:
-                return True
-            
-            buf_cls = ctypes.create_unicode_buffer(256)
-            user32.GetClassNameW(hwnd, buf_cls, 256)
-            cls = buf_cls.value
-            
-            if cls in ["Qt51514QWindowIcon", "WeChatMainWndForPC"]:
-                rect = ctypes.wintypes.RECT()
-                user32.GetWindowRect(hwnd, ctypes.byref(rect))
-                w = rect.right - rect.left
-                h = rect.bottom - rect.top
-                if w > 400 and h > 400:
-                    pid_windows[pid.value] = {
-                        'hwnd': hwnd,
-                        'pid': pid.value,
-                        'cls': cls,
-                        'area': w * h,
-                        'rect': (rect.left, rect.top, rect.right, rect.bottom)
-                    }
-        except Exception:
-            pass
-        return True
+    if "weixin252121438" in account_key or "weixin252121438" in ident:
+        return "weixin252121438"
+    if "weixin2" in account_key or "weixin2" in ident or "weixin2" in mob:
+        return "weixin2"
+    if nick and nick not in ["微信1", "微信2", "未知用户"]:
+        return nick
+    if ident:
+        return ident
+    return account_key
 
-    cb = WNDENUMPROC(enum_cb)
-    user32.EnumDesktopWindows(h_desk, cb, 0)
-    return pid_windows
-
-def click_screen(x, y):
-    user32.SetCursorPos(int(x), int(y))
-    time.sleep(0.1)
-    user32.mouse_event(0x0002, 0, 0, 0, 0)
-    time.sleep(0.08)
-    user32.mouse_event(0x0004, 0, 0, 0, 0)
-    time.sleep(0.1)
-
-def find_applet_window():
-    """查找当前运行中梦享玩小程序窗口"""
-    h_desk = user32.OpenInputDesktop(0, False, 0x01FF)
-    if not h_desk:
-        h_desk = user32.OpenDesktopW("Default", 0, False, 0x01FF)
-    user32.SetThreadDesktop(h_desk)
-    
-    applet_hwnds = []
-    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-    def enum_cb(h, lparam):
-        if user32.IsWindowVisible(h):
-            pid = wintypes.DWORD()
-            user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
-            try:
-                p = psutil.Process(pid.value)
-                if 'wechatappex' in p.name().lower():
-                    buf_title = ctypes.create_unicode_buffer(512)
-                    user32.GetWindowTextW(h, buf_title, 512)
-                    rect = wintypes.RECT()
-                    user32.GetWindowRect(h, ctypes.byref(rect))
-                    w = rect.right - rect.left
-                    h_val = rect.bottom - rect.top
-                    if w > 200 and h_val > 200:
-                        applet_hwnds.append((h, pid.value, buf_title.value, rect))
-            except:
-                pass
-        return True
-    
-    user32.EnumDesktopWindows(h_desk, WNDENUMPROC(enum_cb), 0)
-    return applet_hwnds
-
-def activate_and_open_miniapp(hwnd, pid, index, acc_key=""):
-    """激活指定微信主窗口并通过原生搜索唤醒打开小程序，自动模拟授权登录"""
-    try:
-        set_system_proxy(False)
-        h_desk = user32.OpenInputDesktop(0, False, 0x01FF)
-        if not h_desk:
-            h_desk = user32.OpenDesktopW("Default", 0, False, 0x01FF)
-        if h_desk:
-            user32.SetThreadDesktop(h_desk)
-            
-        cur_thread = kernel32.GetCurrentThreadId()
-        target_thread = user32.GetWindowThreadProcessId(hwnd, None)
-        if cur_thread != target_thread and target_thread != 0:
-            user32.AttachThreadInput(cur_thread, target_thread, True)
-        
-        # 统一恢复并固定窗口位置，避免坐标错位
-        user32.ShowWindow(hwnd, 9) # SW_RESTORE
-        user32.ShowWindow(hwnd, 5) # SW_SHOW
-        user32.SetWindowPos(hwnd, -1, 100, 100, 1000, 700, 0x0040) # HWND_TOP + SWP_SHOWWINDOW
-        user32.SetForegroundWindow(hwnd)
-        user32.BringWindowToTop(hwnd)
-        
-        if cur_thread != target_thread and target_thread != 0:
-            user32.AttachThreadInput(cur_thread, target_thread, False)
-        
-        time.sleep(0.6)
-        app_logger.info(f"📱 正在为第 {index} 个微信 [{acc_key}] (HWND: {hwnd}, PID: {pid}) 从左侧小程序面板打开'梦享玩'...")
-        
-        # 1. 窗口位置标准化 (100, 100, 1000, 750)
-        user32.SetWindowPos(hwnd, -1, 100, 100, 1000, 750, 0x0040)
-        time.sleep(0.3)
-        
-        # 2. 点击左侧边栏“小程序”面板图标 (坐标 x=100+28=128, y=100+335=435)
-        user32.SetCursorPos(128, 435)
-        time.sleep(0.1)
-        user32.mouse_event(0x0002, 0, 0, 0, 0)
-        time.sleep(0.08)
-        user32.mouse_event(0x0004, 0, 0, 0, 0)
-        time.sleep(1.2)
-        
-        # 3. 查找弹出的小程序面板窗口 (Chrome_WidgetWin_0)
-        panel_rect = None
-        def find_panel_cb(hw, lp):
-            nonlocal panel_rect
-            if user32.IsWindowVisible(hw):
-                buf_c = ctypes.create_unicode_buffer(256)
-                user32.GetClassNameW(hw, buf_c, 256)
-                if buf_c.value == 'Chrome_WidgetWin_0':
-                    r = wintypes.RECT()
-                    user32.GetWindowRect(hw, ctypes.byref(r))
-                    if (r.right - r.left) > 500 and (r.bottom - r.top) > 400:
-                        panel_rect = r
-            return True
-            
-        user32.EnumDesktopWindows(h_desk, ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(find_panel_cb), 0)
-        
-        if panel_rect:
-            # 4. 点击小程序面板中的搜索框并输入“梦享玩”
-            user32.SetCursorPos(panel_rect.left + 250, panel_rect.top + 45)
-            time.sleep(0.1)
-            user32.mouse_event(0x0002, 0, 0, 0, 0)
-            time.sleep(0.08)
-            user32.mouse_event(0x0004, 0, 0, 0, 0)
-            time.sleep(0.4)
-            
-            pyperclip.copy("梦享玩")
-            user32.keybd_event(0x11, 0, 0, 0) # Ctrl
-            user32.keybd_event(0x56, 0, 0, 0) # V
-            time.sleep(0.05)
-            user32.keybd_event(0x56, 0, 2, 0)
-            user32.keybd_event(0x11, 0, 2, 0)
-            time.sleep(1.0)
-            
-            # 回车确认搜索
-            user32.keybd_event(0x0D, 0, 0, 0)
-            time.sleep(0.08)
-            user32.keybd_event(0x0D, 0, 2, 0)
-            time.sleep(1.2)
-            
-            # 点击搜索结果列表第一项
-            user32.SetCursorPos(panel_rect.left + 200, panel_rect.top + 160)
-            time.sleep(0.1)
-            user32.mouse_event(0x0002, 0, 0, 0, 0)
-            time.sleep(0.08)
-            user32.mouse_event(0x0004, 0, 0, 0, 0)
-            time.sleep(3.0)
-        
-        # 5. 定位并前置小程序窗口，执行界面授权触控
-        applets = find_applet_window()
-        if applets:
-            app_h = applets[0][0]
-            user32.ShowWindow(app_h, 9)
-            user32.ShowWindow(app_h, 5)
-            user32.SetWindowPos(app_h, -1, 200, 100, 500, 800, 0x0040)
-            user32.SetForegroundWindow(app_h)
-            time.sleep(0.8)
-            
-            app_logger.info(f"🖱️ 正在小程序界面模拟点击触发授权登录...")
-            # 点击“我的”触发授权检查 (screen x=200+350=550, y=100+730=830)
-            user32.SetCursorPos(550, 830)
-            time.sleep(0.1)
-            user32.mouse_event(0x0002, 0, 0, 0, 0)
-            time.sleep(0.08)
-            user32.mouse_event(0x0004, 0, 0, 0, 0)
-            time.sleep(1.0)
-            
-            # 点击“每日转盘” (screen x=200+265=465, y=100+360=460)
-            user32.SetCursorPos(465, 460)
-            time.sleep(0.1)
-            user32.mouse_event(0x0002, 0, 0, 0, 0)
-            time.sleep(0.08)
-            user32.mouse_event(0x0004, 0, 0, 0, 0)
-            time.sleep(1.5)
-    except Exception as e:
-        app_logger.error(f"激活微信窗口失败: {e}")
-
-def trigger_dual_wechat_relogin(target_acc_key=None):
-    """
-    自愈唤醒微信并抓包最新 Token
-    支持指定单个账号自愈（如 'weixin252121438' 或 'weixin2'），或全部自愈
-    """
-    global current_relogin_target_account
-    set_system_proxy(False)
-    windows_map = get_main_wechat_windows()
-    if not windows_map:
-        app_logger.error("❌ 未检测到运行中的微信主窗口，请确保微信多开正常挂在后台！")
-        return False
-        
-    sorted_pids = sorted(windows_map.keys())
-    app_logger.info(f"🔍 找到 {len(sorted_pids)} 个微信主窗口实例...")
-    
-    target_tasks = []
-    if target_acc_key == "weixin252121438" or target_acc_key == "1":
-        if len(sorted_pids) >= 1:
-            target_tasks.append((sorted_pids[0], windows_map[sorted_pids[0]], 1, "weixin252121438"))
-    elif target_acc_key == "weixin2" or target_acc_key == "2":
-        if len(sorted_pids) >= 2:
-            target_tasks.append((sorted_pids[1], windows_map[sorted_pids[1]], 2, "weixin2"))
-    else:
-        # 默认自愈所有账号
-        acc_keys = ["weixin252121438", "weixin2"]
-        for idx, pid in enumerate(sorted_pids[:2], start=1):
-            target_tasks.append((pid, windows_map[pid], idx, acc_keys[idx-1] if idx-1 < len(acc_keys) else f"acc_{idx}"))
-            
-    for pid, info, idx, acc_key in target_tasks:
-        current_relogin_target_account = acc_key
-        
-        # 1. 确保网络代理禁用，避免小程序白屏
-        set_system_proxy(False)
-                    
-        # 2. 通过主微信窗口定位并拉起小程序
-        activate_and_open_miniapp(info['hwnd'], pid, idx, acc_key)
-        
-        app_logger.info(f"⏳ 正在为账号 {idx} [{acc_key}] 监控最新 Token (最多等待 15 秒)...")
-        for _ in range(15):
-            time.sleep(1)
-            # 1. 优先扫描进程内存直接提取有效 Token
-            try:
-                mem_tokens = scan_memory_for_valid_tokens()
-                if mem_tokens:
-                    save_account({"token": mem_tokens[0]}, acc_key=acc_key)
-                    app_logger.info(f"✅ 账号 {idx} [{acc_key}] 从内存成功捕获有效 Token！")
-                    break
-            except Exception:
-                pass
-                
-            # 2. 检查代理拦截或外部更新的 Token
-            accs = load_accounts()
-            cur_tok = accs.get(acc_key, {}).get("token")
-            if test_token_valid(cur_tok):
-                app_logger.info(f"✅ 账号 {idx} [{acc_key}] 成功自愈获取有效 Token！")
+def sync_external_token_files(acc_key, token_val, refresh_val=""):
+    """将捕获到的 Token 实时同步回外部独立的 token.json 文件"""
+    ext_path = EXTERNAL_TOKEN_FILES.get(acc_key)
+    if not ext_path:
+        for k in EXTERNAL_TOKEN_FILES:
+            if k in acc_key or acc_key in k:
+                ext_path = EXTERNAL_TOKEN_FILES[k]
                 break
                 
-        # 抓取完成后关闭小程序窗口
-        applets = find_applet_window()
-        for ah, apid, atitle, arect in applets:
-            try:
-                user32.PostMessageW(ah, 0x0010, 0, 0) # WM_CLOSE
-            except:
-                pass
-        time.sleep(1.5)
-        
-    current_relogin_target_account = None
-    return True
-
-# ======================= [1. 邮件发送模块 (带多轮重试 & 智能排版)] =======================
-def send_email_report(account_index, nickname, mobile, success, status_desc, prize_info, raw_msg):
-    """
-    给指定邮箱发送独立的签到结果邮件 (带 3 次网络重试机制)
-    """
-    if not SMTP_CONFIG.get("enabled"):
-        return
-    
-    # 智能标签与色彩
-    if success:
-        status_tag = "✅签到成功"
-        theme_color = "#2e7d32"
-    elif "今日已完成" in status_desc or "上限" in status_desc:
-        status_tag = "🛑今日已达上限"
-        theme_color = "#1565c0"
-    elif "冷却" in status_desc:
-        status_tag = "⏳冷却等待中"
-        theme_color = "#f57c00"
-    else:
-        status_tag = "⚠️签到反馈"
-        theme_color = "#d32f2f"
-        
-    tail_mobile = mobile[-4:] if len(mobile) >= 4 else mobile
-    subject = f"【{status_tag}】账号{account_index}：{nickname}({tail_mobile}) - {prize_info}"
-    now_time = time.strftime("%Y-%m-%d %H:%M:%S")
-    
-    html_content = f"""
-    <html>
-    <body style="font-family: Arial, sans-serif; background-color: #f4f6f9; padding: 20px;">
-        <div style="max-width: 600px; margin: auto; background-color: #ffffff; padding: 25px; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.08);">
-            <h2 style="color: {theme_color}; border-bottom: 2px solid #eee; padding-bottom: 10px; margin-top: 0;">
-                🎉 微信账号 {account_index} 转盘签到提醒
-            </h2>
-            <table style="width: 100%; border-collapse: collapse; margin-top: 15px;">
-                <tr>
-                    <td style="padding: 10px; color: #666; width: 120px; border-bottom: 1px solid #f0f0f0;"><b>账号序号：</b></td>
-                    <td style="padding: 10px; font-weight: bold; border-bottom: 1px solid #f0f0f0;">第 {account_index} 个微信账号</td>
-                </tr>
-                <tr>
-                    <td style="padding: 10px; color: #666; border-bottom: 1px solid #f0f0f0;"><b>用户昵称：</b></td>
-                    <td style="padding: 10px; font-weight: bold; border-bottom: 1px solid #f0f0f0;">{nickname}</td>
-                </tr>
-                <tr>
-                    <td style="padding: 10px; color: #666; border-bottom: 1px solid #f0f0f0;"><b>手机号码：</b></td>
-                    <td style="padding: 10px; border-bottom: 1px solid #f0f0f0;">{mobile}</td>
-                </tr>
-                <tr>
-                    <td style="padding: 10px; color: #666; border-bottom: 1px solid #f0f0f0;"><b>签到状态：</b></td>
-                    <td style="padding: 10px; color: {theme_color}; font-weight: bold; border-bottom: 1px solid #f0f0f0;">{status_desc}</td>
-                </tr>
-                <tr style="background-color: #fff8e1;">
-                    <td style="padding: 10px; color: #666; border-bottom: 1px solid #f0f0f0;"><b>获得奖励/提示：</b></td>
-                    <td style="padding: 10px; font-size: 15px; color: #e65100; font-weight: bold; border-bottom: 1px solid #f0f0f0;">{prize_info}</td>
-                </tr>
-                <tr>
-                    <td style="padding: 10px; color: #666; border-bottom: 1px solid #f0f0f0;"><b>服务器响应：</b></td>
-                    <td style="padding: 10px; color: #555; border-bottom: 1px solid #f0f0f0;">{raw_msg}</td>
-                </tr>
-                <tr>
-                    <td style="padding: 10px; color: #666;"><b>执行时间：</b></td>
-                    <td style="padding: 10px; color: #888;">{now_time}</td>
-                </tr>
-            </table>
-            <hr style="border: none; border-top: 1px solid #eee; margin-top: 20px;">
-            <p style="font-size: 12px; color: #999; text-align: center;">此邮件由后台全自动签到助手发送，每 5 小时自动巡检执行一次。</p>
-        </div>
-    </body>
-    </html>
-    """
-    for attempt in range(1, MAX_NETWORK_RETRIES + 1):
+    if ext_path:
         try:
-            msg = MIMEMultipart()
-            msg["From"] = Header(f"微信双开签到助手 <{SMTP_CONFIG['sender_email']}>", "utf-8")
-            msg["To"] = Header(SMTP_CONFIG["receiver_email"], "utf-8")
-            msg["Subject"] = Header(subject, "utf-8")
-            msg.attach(MIMEText(html_content, "html", "utf-8"))
-            server = smtplib.SMTP_SSL(SMTP_CONFIG["smtp_server"], SMTP_CONFIG["smtp_port"], timeout=15)
-            server.login(SMTP_CONFIG["sender_email"], SMTP_CONFIG["auth_code"])
-            server.sendmail(SMTP_CONFIG["sender_email"], [SMTP_CONFIG["receiver_email"]], msg.as_string())
-            server.quit()
-            app_logger.info(f"📧 [邮件已发送] 账号 {account_index}({nickname}) 结果已送达 {SMTP_CONFIG['receiver_email']}")
-            return True
-        except Exception as e:
-            app_logger.warning(f"⚠️ 发送邮件第 {attempt}/{MAX_NETWORK_RETRIES} 次尝试失败: {e}")
-            if attempt < MAX_NETWORK_RETRIES:
-                time.sleep(2)
-            else:
-                app_logger.error(f"❌ 邮件发送最终失败: {e}")
-    return False
-
-# ======================= [2. 账号数据持久化与多源同步] =======================
-def load_accounts():
-    db = {}
-    with db_lock:
-        if os.path.exists(DB_FILE):
-            try:
-                with open(DB_FILE, "r", encoding="utf-8") as f:
-                    db = json.load(f)
-            except Exception:
-                db = {}
-                
-        # 兼容外部 token.json 文件
-        for acc_key, ext_path in EXTERNAL_TOKEN_FILES.items():
+            os.makedirs(os.path.dirname(ext_path), exist_ok=True)
+            t_data = {}
             if os.path.exists(ext_path):
                 try:
                     with open(ext_path, "r", encoding="utf-8") as f:
-                        ext_data = json.load(f)
-                        rt = ext_data.get("refresh_token") or ext_data.get("refreshToken")
-                        tok = ext_data.get("token")
-                        if rt or tok:
-                            if acc_key not in db:
-                                db[acc_key] = {
-                                    "mobile": acc_key,
-                                    "nickname": acc_key,
-                                    "token": tok or "",
-                                    "refreshToken": rt or "",
-                                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
-                                }
-                            else:
-                                if rt:
-                                    db[acc_key]["refreshToken"] = rt
-                                if tok and not db[acc_key].get("token"):
-                                    db[acc_key]["token"] = tok
+                        t_data = json.load(f)
                 except Exception:
                     pass
+            t_data["token"] = token_val
+            if refresh_val:
+                t_data["refreshToken"] = refresh_val
+            t_data["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            with open(ext_path, "w", encoding="utf-8") as f:
+                json.dump(t_data, f, ensure_ascii=False, indent=2)
+            app_logger.info(f"💾 已将最新 Token 同步写入外部文件: {ext_path}")
+        except Exception as e:
+            app_logger.warning(f"⚠️ 同步外部 Token 文件异常: {e}")
 
-    return db
-
-def save_account(user_data, acc_key=None):
-    """保存或更新单个账号信息，并将最新 Token 同步回写 external token.json"""
-    global current_relogin_target_account
+def load_accounts():
+    """读取已存储的双账号信息，并与外部 token.json 进行双向合并补全"""
     with db_lock:
-        db = {}
+        data = {}
         if os.path.exists(DB_FILE):
             try:
                 with open(DB_FILE, "r", encoding="utf-8") as f:
-                    db = json.load(f)
+                    data = json.load(f)
             except Exception:
-                db = {}
-
-        target_key = acc_key or current_relogin_target_account or user_data.get("ident") or user_data.get("mobile")
-        
-        # 如果未指定 target_key，优先匹配现有账号列表中 Token 无效的账号
-        if not target_key or target_key not in db:
-            for k, v in db.items():
-                if not test_token_valid(v.get("token")):
-                    target_key = k
-                    break
+                data = {}
+                
+        # 兼容读取外部 token.json
+        for acc_k, ext_path in EXTERNAL_TOKEN_FILES.items():
+            if os.path.exists(ext_path):
+                try:
+                    with open(ext_path, "r", encoding="utf-8") as f:
+                        ext_d = json.load(f)
+                    tok = ext_d.get("token") or ext_d.get("accessToken")
+                    rt = ext_d.get("refreshToken")
+                    if tok and (acc_k not in data or not data[acc_k].get("token")):
+                        if acc_k not in data:
+                            data[acc_k] = {}
+                        data[acc_k]["token"] = tok
+                        if rt:
+                            data[acc_k]["refreshToken"] = rt
+                        data[acc_k]["ident"] = acc_k
+                        data[acc_k]["nickname"] = acc_k
+                except Exception:
+                    pass
                     
-        # 若仍无法匹配，回退到首个账号
-        if not target_key:
-            keys = list(db.keys())
-            target_key = keys[0] if keys else "weixin252121438"
+        # 默认初始化预留双账号模板
+        if "weixin252121438" not in data:
+            data["weixin252121438"] = {"mobile": "", "nickname": "weixin252121438", "ident": "weixin252121438", "token": "", "refreshToken": ""}
+        if "weixin2" not in data:
+            data["weixin2"] = {"mobile": "", "nickname": "weixin2", "ident": "weixin2", "token": "", "refreshToken": ""}
+            
+        return data
 
-        existing = db.get(target_key, {})
-        new_token = user_data.get("token") or existing.get("token", "")
-        new_refresh = user_data.get("refreshToken") or user_data.get("refresh_token") or existing.get("refreshToken", "")
-        daily_date = user_data.get("daily_completed_date") or existing.get("daily_completed_date", "")
+def save_account(account_info, acc_key=None):
+    """保存或更新账号信息，同时写入数据库与外部文件"""
+    with db_lock:
+        data = {}
+        if os.path.exists(DB_FILE):
+            try:
+                with open(DB_FILE, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except Exception:
+                data = {}
+                
+        mob = account_info.get("mobile") or ""
+        ident = account_info.get("ident") or ""
+        token = account_info.get("token") or ""
+        rt = account_info.get("refreshToken") or ""
         
-        db[target_key] = {
-            "mobile": existing.get("mobile", target_key),
-            "nickname": existing.get("nickname", target_key),
-            "ident": existing.get("ident", target_key),
-            "token": new_token,
-            "refreshToken": new_refresh,
-            "daily_completed_date": daily_date,
-            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
-        }
+        target_key = acc_key
+        if not target_key:
+            if ident and ident in data:
+                target_key = ident
+            elif mob and mob in data:
+                target_key = mob
+            elif "weixin252121438" in ident or "138" in mob:
+                target_key = "weixin252121438"
+            elif "weixin2" in ident or "weixin2" in mob:
+                target_key = "weixin2"
+            else:
+                for k in ["weixin252121438", "weixin2"]:
+                    if k in data and (not data[k].get("token") or data[k].get("token") == token):
+                        target_key = k
+                        break
+                        
+        if not target_key:
+            target_key = f"acc_{mob or ident or len(data) + 1}"
+            
+        if target_key not in data:
+            data[target_key] = {}
+            
+        data[target_key].update(account_info)
+        data[target_key]["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
         
         with open(DB_FILE, "w", encoding="utf-8") as f:
-            json.dump(db, f, ensure_ascii=False, indent=2)
+            json.dump(data, f, ensure_ascii=False, indent=2)
             
-        # 同步回写 external token.json
-        if target_key in EXTERNAL_TOKEN_FILES:
+        if token:
+            sync_external_token_files(target_key, token, rt)
+            
+        return target_key
+
+# ======================= [2. 微信窗口自愈与界面交互 (支持双微信多实例)] =======================
+def get_main_wechat_windows():
+    """获取所有运行中的微信主界面窗口句柄 (兼容多开与后台桌面)"""
+    windows = []
+    
+    h_desk = user32.OpenInputDesktop(0, False, 0x01FF)
+    if h_desk:
+        user32.SetThreadDesktop(h_desk)
+        
+    def enum_windows_callback(hwnd, extra):
+        if not user32.IsWindowVisible(hwnd):
+            return True
+            
+        class_buffer = ctypes.create_unicode_buffer(256)
+        user32.GetClassNameW(hwnd, class_buffer, 256)
+        cls_name = class_buffer.value
+        
+        if "Qt51514QWindowIcon" in cls_name or "WeChatMainWndForPC" in cls_name:
+            rect = wintypes.RECT()
+            user32.GetWindowRect(hwnd, ctypes.byref(rect))
+            width = rect.right - rect.left
+            height = rect.bottom - rect.top
+            
+            if width > 450 and height > 450:
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+                try:
+                    p = psutil.Process(pid.value)
+                    if "weixin" in p.name().lower() or "wechat" in p.name().lower():
+                        windows.append({
+                            "hwnd": hwnd,
+                            "pid": pid.value,
+                            "class": cls_name,
+                            "rect": (rect.left, rect.top, width, height)
+                        })
+                except Exception:
+                    pass
+        return True
+
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    if h_desk:
+        user32.EnumDesktopWindows(h_desk, WNDENUMPROC(enum_windows_callback), 0)
+    else:
+        user32.EnumWindows(WNDENUMPROC(enum_windows_callback), 0)
+        
+    windows.sort(key=lambda x: x["pid"])
+    return windows
+
+def activate_and_open_miniapp(account_name="weixin252121438"):
+    """
+    自愈拉起逻辑：
+    1. 激活对应微信实例窗口
+    2. 优先通过微信左侧小程序面板搜索“梦享玩”点击进入
+    3. 同步向“文件传输助手”发送小程序短链接保障唤醒
+    """
+    h_desk = user32.OpenInputDesktop(0, False, 0x01FF)
+    if h_desk:
+        user32.SetThreadDesktop(h_desk)
+        
+    wechat_windows = get_main_wechat_windows()
+    if not wechat_windows:
+        app_logger.warning("⚠️ 未检测到运行中的微信客户端主窗口，尝试直接启动微信...")
+        if os.path.exists(WECHAT_INSTALL_PATH):
+            subprocess.Popen([WECHAT_INSTALL_PATH])
+            time.sleep(3)
+            wechat_windows = get_main_wechat_windows()
+            
+    if not wechat_windows:
+        app_logger.error("❌ 无法找到任何微信主窗口，请确认电脑端微信已打开并登录。")
+        return False
+        
+    target_idx = 0
+    if "2" in account_name or "weixin2" in account_name:
+        target_idx = 1 if len(wechat_windows) > 1 else 0
+        
+    target_win = wechat_windows[target_idx]
+    hwnd = target_win["hwnd"]
+    pid = target_win["pid"]
+    
+    app_logger.info(f"📱 正在为第 {target_idx+1} 个微信 [{account_name}] (HWND: {hwnd}, PID: {pid}) 唤醒'梦享玩'小程序...")
+    
+    # 1. 恢复并前置微信窗口
+    user32.ShowWindow(hwnd, 9)
+    user32.SetForegroundWindow(hwnd)
+    time.sleep(0.5)
+    
+    # 标准化窗口坐标
+    user32.MoveWindow(hwnd, 100, 100, 1000, 750, True)
+    time.sleep(0.5)
+    
+    # 2. 点击左侧工具栏“小程序面板”图标 (微信 4.x: x≈128, y≈435)
+    click_x = 128
+    click_y = 435
+    user32.SetCursorPos(click_x, click_y)
+    time.sleep(0.2)
+    user32.mouse_event(0x0002, 0, 0, 0, 0)
+    user32.mouse_event(0x0004, 0, 0, 0, 0)
+    time.sleep(1.2)
+    
+    # 3. 检查小程序聚合面板 (Chrome_WidgetWin_0)
+    panel_hwnds = []
+    def enum_panel(h, _):
+        if user32.IsWindowVisible(h):
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetClassNameW(h, buf, 256)
+            if "Chrome_WidgetWin_0" in buf.value:
+                r = wintypes.RECT()
+                user32.GetWindowRect(h, ctypes.byref(r))
+                w = r.right - r.left
+                h_len = r.bottom - r.top
+                if 200 < w < 800 and 300 < h_len < 900:
+                    panel_hwnds.append((h, r.left, r.top, w, h_len))
+        return True
+        
+    WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
+    user32.EnumWindows(WNDENUMPROC(enum_panel), 0)
+    
+    if panel_hwnds:
+        p_hwnd, px, py, pw, ph = panel_hwnds[0]
+        user32.SetForegroundWindow(p_hwnd)
+        time.sleep(0.3)
+        # 点击搜索框输入“梦享玩”
+        search_x = px + 100
+        search_y = py + 35
+        user32.SetCursorPos(search_x, search_y)
+        user32.mouse_event(0x0002, 0, 0, 0, 0)
+        user32.mouse_event(0x0004, 0, 0, 0, 0)
+        time.sleep(0.3)
+        
+        pyperclip.copy("梦享玩")
+        user32.keybd_event(0x11, 0, 0, 0) # Ctrl
+        user32.keybd_event(ord('V'), 0, 0, 0)
+        user32.keybd_event(ord('V'), 0, 0x0002, 0)
+        user32.keybd_event(0x11, 0, 0x0002, 0)
+        time.sleep(0.3)
+        user32.keybd_event(0x0D, 0, 0, 0) # Enter
+        user32.keybd_event(0x0D, 0, 0x0002, 0)
+        time.sleep(0.8)
+        
+        # 点击第一个搜索结果
+        result_x = px + 150
+        result_y = py + 120
+        user32.SetCursorPos(result_x, result_y)
+        user32.mouse_event(0x0002, 0, 0, 0, 0)
+        user32.mouse_event(0x0004, 0, 0, 0, 0)
+        time.sleep(1.5)
+        
+    time.sleep(2)
+    
+    # 4. 定位梦享玩小程序窗口并点击进入“我的”触发身份同步
+    applet_windows = []
+    def enum_applet(h, _):
+        if user32.IsWindowVisible(h):
+            length = user32.GetWindowTextLengthW(h)
+            if length > 0:
+                buf = ctypes.create_unicode_buffer(length + 1)
+                user32.GetWindowTextW(h, buf, length + 1)
+                if "梦享玩" in buf.value:
+                    r = wintypes.RECT()
+                    user32.GetWindowRect(h, ctypes.byref(r))
+                    applet_windows.append((h, r.left, r.top, r.right - r.left, r.bottom - r.top))
+        return True
+        
+    user32.EnumWindows(WNDENUMPROC(enum_applet), 0)
+    
+    if applet_windows:
+        a_hwnd, ax, ay, aw, ah = applet_windows[0]
+        user32.ShowWindow(a_hwnd, 9)
+        user32.SetForegroundWindow(a_hwnd)
+        time.sleep(0.5)
+        # 点击底部“我的”
+        my_x = ax + int(aw * 0.85)
+        my_y = ay + int(ah * 0.95)
+        user32.SetCursorPos(my_x, my_y)
+        user32.mouse_event(0x0002, 0, 0, 0, 0)
+        user32.mouse_event(0x0004, 0, 0, 0, 0)
+        time.sleep(1)
+        
+    return True
+
+# ======================= [3. 毫秒级进程内存捕获引擎 (免代理/零断网)] =======================
+def scan_memory_for_valid_tokens(target_acc_key=None, max_wait_sec=15):
+    """
+    高速定向扫描微信小程序进程 (WeChatAppEx.exe) 私有内存块，
+    毫秒级提取有效 JWT Token 并自动与目标账号绑定。
+    """
+    app_logger.info(f"⏳ 正在为账号 [{target_acc_key or '全部'}] 监控内存 Token (最多等待 {max_wait_sec} 秒)...")
+    start_time = time.time()
+    
+    kernel32_open = kernel32.OpenProcess
+    kernel32_query = kernel32.VirtualQueryEx
+    kernel32_read = kernel32.ReadProcessMemory
+    kernel32_close = kernel32.CloseHandle
+    
+    jwt_regex = re.compile(rb'eyJhbGciOi[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+')
+    buf = ctypes.create_string_buffer(256 * 1024)
+    bytes_read = ctypes.c_size_t()
+    mbi = (ctypes.c_void_p * 7)()
+    
+    seen_tokens = set()
+    
+    while time.time() - start_time < max_wait_sec:
+        # 定向筛选 WeChatAppEx.exe 进程
+        appex_pids = []
+        for p in psutil.process_iter(['pid', 'name']):
             try:
-                ext_path = EXTERNAL_TOKEN_FILES[target_key]
-                os.makedirs(os.path.dirname(ext_path), exist_ok=True)
-                with open(ext_path, "w", encoding="utf-8") as ef:
-                    json.dump({
-                        "refresh_token": db[target_key]["refreshToken"],
-                        "token": db[target_key]["token"]
-                    }, ef, indent=2)
+                name = (p.info['name'] or '').lower()
+                if 'wechatappex' in name:
+                    appex_pids.append(p.info['pid'])
             except Exception:
                 pass
                 
-        app_logger.info(f"🎉 [数据持久化] 成功更新保存账号 [{db[target_key].get('nickname', target_key)} ({target_key})] 最新 Token 数据！")
+        for pid in appex_pids:
+            h_process = kernel32_open(0x0010 | 0x0400, False, pid)
+            if not h_process:
+                continue
+                
+            addr = 0
+            while kernel32_query(h_process, ctypes.c_void_p(addr), ctypes.byref(mbi), 48):
+                base_addr = mbi[0] or 0
+                region_size = mbi[3] or 0
+                state = mbi[4] or 0
+                protect = mbi[5] or 0
+                
+                # 仅扫描 MEM_COMMIT (0x1000) 且具备读写权限 (PAGE_READWRITE=0x04) 的堆内存
+                if state == 0x1000 and (protect & 0x04) and region_size <= 16 * 1024 * 1024:
+                    curr = base_addr
+                    end = base_addr + region_size
+                    while curr < end:
+                        chunk_size = min(256 * 1024, end - curr)
+                        if kernel32_read(h_process, ctypes.c_void_p(curr), buf, chunk_size, ctypes.byref(bytes_read)):
+                            raw_chunk = buf.raw[:bytes_read.value]
+                            if b'eyJhbGciOi' in raw_chunk:
+                                for match in jwt_regex.finditer(raw_chunk):
+                                    cand = match.group(0).decode('utf-8', errors='ignore')
+                                    if cand not in seen_tokens:
+                                        seen_tokens.add(cand)
+                                        # 立即向业务接口验证
+                                        is_valid, user_data = test_token_valid(cand)
+                                        if is_valid:
+                                            app_logger.info(f"🎉 [内存直捕] 成功从 WeChatAppEx (PID: {pid}) 捕获有效 Token!")
+                                            kernel32_close(h_process)
+                                            # 保存到对应账号
+                                            acc_k = save_account({
+                                                "token": cand,
+                                                "ident": target_acc_key or "",
+                                                "nickname": user_data.get("nickname") or target_acc_key or "微信用户",
+                                                "mobile": user_data.get("mobile") or ""
+                                            }, acc_key=target_acc_key)
+                                            return cand
+                        curr += chunk_size
+                        
+                addr = base_addr + region_size
+                if addr >= 0x00007FFFFFFF0000:
+                    break
+            kernel32_close(h_process)
+            
+        time.sleep(1.0)
+        
+    return None
 
-def handle_intercepted_token(token, refresh_token=None):
-    """处理代理抓包捕获到的 Token 并持久化存储"""
-    if not token:
-        return
-    save_account({
-        "token": token,
-        "refreshToken": refresh_token
-    })
-
-def scan_memory_for_valid_tokens():
-    """直接扫描微信小程序进程 (WeChatAppEx.exe) 内存空间中的有效 JWT Token，极速提取"""
-    found_tokens = []
-    buf = ctypes.create_string_buffer(262144)
-    bread = ctypes.c_size_t()
-    mbi = (ctypes.c_void_p * 7)()
-    
-    # 仅扫描小程序渲染和主进程 WeChatAppEx.exe
-    target_pids = [
-        p.info['pid'] for p in psutil.process_iter(['pid', 'name'])
-        if 'wechatappex' in (p.info['name'] or '').lower()
-    ]
-    
-    for pid in target_pids:
-        h_proc = kernel32.OpenProcess(0x0010 | 0x0400, False, pid)
-        if not h_proc:
-            continue
-        addr = 0
-        while kernel32.VirtualQueryEx(h_proc, ctypes.c_void_p(addr), ctypes.byref(mbi), 48):
-            base = mbi[0] or 0
-            size = mbi[3] or 0
-            state = mbi[4] or 0
-            protect = mbi[5] or 0
-            # 只扫描已提交、可读写的私有/映射内存
-            if state == 0x1000 and (protect & 0x04) and size <= 32 * 1024 * 1024:
-                curr = base
-                end = base + size
-                while curr < end:
-                    chunk = min(262144, end - curr)
-                    if kernel32.ReadProcessMemory(h_proc, ctypes.c_void_p(curr), buf, chunk, ctypes.byref(bread)):
-                        data = buf.raw[:bread.value]
-                        if b'eyJhbGciOi' in data:
-                            for m in re.finditer(rb'eyJhbGciOi[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+', data):
-                                try:
-                                    cand = m.group(0).decode('utf-8', errors='ignore')
-                                    if cand not in found_tokens:
-                                        if test_token_valid(cand):
-                                            found_tokens.append(cand)
-                                            kernel32.CloseHandle(h_proc)
-                                            return found_tokens
-                                except Exception:
-                                    pass
-                    curr += chunk
-            addr = base + size
-            if addr >= 0x00007FFFFFFF0000:
-                break
-        kernel32.CloseHandle(h_proc)
-    return found_tokens
-
-# ======================= [3. 内嵌 Mitmproxy 抓包代理服务] =======================
-from mitmproxy import http, options
-from mitmproxy.tools.dump import DumpMaster
-
-class MiniAppInterceptor:
-    def request(self, flow: http.HTTPFlow) -> None:
-        if "mongoose.liangjingkeji.com" in flow.request.pretty_url:
-            tok = flow.request.headers.get("token", "") or flow.request.headers.get("Authorization", "")
-            if tok.startswith("Bearer "):
-                tok = tok.split("Bearer ")[1].strip()
-            if tok and len(tok) >= 20:
-                app_logger.info(f"🎯 [抓包拦截] 从请求头捕获到有效 Token: {tok[:10]}***")
-                threading.Thread(target=handle_intercepted_token, args=(tok,), daemon=True).start()
-
-    def response(self, flow: http.HTTPFlow) -> None:
-        if "mongoose.liangjingkeji.com" in flow.request.pretty_url:
+def start_background_memory_harvester():
+    """后台持续监控守护线程：只要用户在 PC 上点开梦享玩，立刻毫秒级提取并持久化 Token"""
+    def harvester_loop():
+        while True:
             try:
-                res = json.loads(flow.response.text)
-                data = res.get("data")
-                tok = None
-                rt = None
-                if isinstance(data, dict):
-                    tok = data.get("token") or data.get("accessToken")
-                    rt = data.get("refreshToken")
-                elif isinstance(data, str) and len(data) >= 20:
-                    tok = data
-                    
-                if tok:
-                    app_logger.info(f"🎯 [抓包拦截] 从服务端响应捕获到全新 Token: {tok[:10]}***")
-                    threading.Thread(target=handle_intercepted_token, args=(tok, rt), daemon=True).start()
+                scan_memory_for_valid_tokens(target_acc_key=None, max_wait_sec=2)
             except Exception:
                 pass
-
-async def _run_proxy_async(port):
-    opts = options.Options(
-        listen_host="127.0.0.1",
-        listen_port=port,
-        ssl_insecure=True,
-    )
-    master = DumpMaster(opts, with_termlog=False, with_dumper=False)
-    master.addons.add(MiniAppInterceptor())
-    app_logger.info(f"✅ 内嵌抓包代理服务已就绪 (监听端口: {port})")
-    await master.run()
-
-def start_embedded_proxy():
-    clean_port_conflict(PROXY_PORT)
-    set_system_proxy(enable=True, host="127.0.0.1", port=PROXY_PORT)
-    try:
-        asyncio.run(_run_proxy_async(PROXY_PORT))
-    except Exception as e:
-        app_logger.error(f"内嵌代理异常退出: {e}")
-    finally:
-        set_system_proxy(enable=False)
+            time.sleep(3.0)
+            
+    t = threading.Thread(target=harvester_loop, daemon=True)
+    t.start()
 
 # ======================= [4. 业务请求与自动签到 (带智能响应解析 & 当日上限停签)] =======================
 def test_token_valid(token):
     """测试 Token 是否有效 (带多次网络重试机制)"""
     if not token or len(token) < 20:
-        return False
+        return False, {}
+        
     url = f"{BASE_URL}/turntable/paying/info"
     headers = {
         "User-Agent": USER_AGENT,
@@ -747,173 +551,272 @@ def test_token_valid(token):
         "Authorization": f"Bearer {token}",
         "shopId": str(SHOP_ID),
         "appId": APP_ID,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Referer": "https://servicewechat.com/wx44a67f9e199a46d0/221/page-frame.html"
+        "Referer": f"https://servicewechat.com/{APP_ID}/221/page-frame.html"
     }
+    
     for attempt in range(1, MAX_NETWORK_RETRIES + 1):
         try:
-            r = http_client.get(url, params={"shopId": SHOP_ID}, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
-            if r.status_code == 200:
-                res = r.json()
-                return res.get("code") in [0, 200]
-            elif r.status_code in [401, 403]:
-                return False
+            resp = http_client.get(url, params={"shopId": SHOP_ID}, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+            if resp.status_code == 200:
+                res_data = resp.json()
+                code = res_data.get("code")
+                if code in [0, 200]:
+                    return True, res_data.get("data") or {}
+                else:
+                    return False, res_data
+            elif resp.status_code in [401, 403]:
+                return False, {}
         except Exception as e:
-            app_logger.warning(f"⚠️ 测试 Token 接口第 {attempt}/{MAX_NETWORK_RETRIES} 次网络异常: {e}")
             if attempt < MAX_NETWORK_RETRIES:
                 time.sleep(2)
-    return False
+            else:
+                return False, {}
+    return False, {}
 
 def try_refresh_token(refresh_token):
-    """尝试使用 refreshToken 静默刷新 token (带多次网络重试机制)"""
+    """使用 RefreshToken 尝试服务端静默续签"""
     if not refresh_token:
         return None
     url = f"{BASE_URL}/wechat/auth/refreshToken"
     headers = {
         "User-Agent": USER_AGENT,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "xweb_xhr": "1",
-        "Referer": "https://servicewechat.com/wx44a67f9e199a46d0/221/page-frame.html"
+        "appId": APP_ID,
+        "shopId": str(SHOP_ID),
+        "Referer": f"https://servicewechat.com/{APP_ID}/221/page-frame.html"
     }
-    for attempt in range(1, MAX_NETWORK_RETRIES + 1):
-        try:
-            r = http_client.get(url, params={"refreshToken": refresh_token}, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
-            if r.status_code == 200:
-                res = r.json()
-                if res.get("code") == 200 and "data" in res:
-                    return res["data"]
-                else:
-                    app_logger.warning(f"⚠️ 刷新 Token 服务端响应: {res.get('msg')}")
-                    return None
-            elif r.status_code in [401, 403, 404, 409]:
-                app_logger.warning(f"⚠️ RefreshToken 已在服务端失效 (状态码 {r.status_code})")
-                return None
-        except Exception as e:
-            app_logger.warning(f"⚠️ 刷新 Token 第 {attempt}/{MAX_NETWORK_RETRIES} 次网络超时/重试: {e}")
-            if attempt < MAX_NETWORK_RETRIES:
-                time.sleep(2)
+    try:
+        resp = http_client.get(url, params={"refreshToken": refresh_token}, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+        if resp.status_code == 200:
+            res_data = resp.json()
+            if res_data.get("code") in [0, 200] and res_data.get("data"):
+                new_tok = res_data["data"].get("token") or res_data["data"].get("accessToken")
+                new_rt = res_data["data"].get("refreshToken") or refresh_token
+                return new_tok, new_rt
+    except Exception:
+        pass
     return None
 
 def play_turntable(token):
-    """执行转盘签到抽奖 (带多次网络重试机制)"""
-    url = f"{BASE_URL}/turntable/play/mp/new"
+    """执行每日转盘签到抽奖"""
+    url = f"{BASE_URL}/turntable/paying/play"
     headers = {
         "User-Agent": USER_AGENT,
         "token": token,
         "Authorization": f"Bearer {token}",
         "shopId": str(SHOP_ID),
         "appId": APP_ID,
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Referer": "https://servicewechat.com/wx44a67f9e199a46d0/221/page-frame.html",
-        "xweb_xhr": "1"
+        "Content-Type": "application/json",
+        "Referer": f"https://servicewechat.com/{APP_ID}/221/page-frame.html"
     }
+    payload = {"shopId": SHOP_ID}
+    
     for attempt in range(1, MAX_NETWORK_RETRIES + 1):
         try:
-            resp = http_client.post(url, data={"shopId": SHOP_ID}, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
-            return resp.json()
+            resp = http_client.post(url, json=payload, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+            if resp.status_code == 200:
+                return resp.json()
+            return {"code": resp.status_code, "msg": f"HTTP {resp.status_code}: {resp.text[:60]}"}
         except Exception as e:
-            app_logger.warning(f"⚠️ 转盘抽奖第 {attempt}/{MAX_NETWORK_RETRIES} 次网络异常: {e}")
             if attempt < MAX_NETWORK_RETRIES:
                 time.sleep(2)
             else:
-                return {"code": -1, "msg": f"网络重试耗尽: {e}"}
+                return {"code": -1, "msg": f"网络请求超时: {e}"}
 
 def parse_prize_info(result):
-    """
-    智能解析转盘抽奖响应
-    返回: (success_bool, status_desc, prize_desc, raw_msg, is_daily_finished)
-    """
+    """智能解析转盘抽奖反馈状态"""
+    if not isinstance(result, dict):
+        return False, "❌ 未知错误", "未知响应", str(result), False
+        
     code = result.get("code")
+    msg = (result.get("msg") or result.get("message") or "").strip()
     data = result.get("data")
-    msg = str(result.get("msg") or "")
     
-    # 1. 抽奖成功
-    if code in [200, 0]:
+    if code in [0, 200]:
         if isinstance(data, dict):
-            coin = data.get("coin") or data.get("num") or data.get("gameCoin") or data.get("score")
-            name = data.get("name") or data.get("prizeName") or data.get("title")
-            if coin is not None:
-                return True, "🎉 抽奖成功", f"获得 {coin} 个游戏币 ({name if name else ''})", str(result), False
-            elif name:
-                return True, "🎉 抽奖成功", f"获得奖励: {name}", str(result), False
-        return True, "🎉 抽奖成功", "获得转盘奖励 (已入账)", str(result), False
+            prize_name = data.get("prizeName") or data.get("name") or "神秘奖品"
+            coin_num = data.get("coin") or data.get("score") or data.get("point")
+            remain_times = data.get("remainTimes") or data.get("surplusCount") or 0
+            
+            detail = f"抽中【{prize_name}】"
+            if coin_num:
+                detail += f" (获得 {coin_num} 游戏币)"
+            if remain_times == 0:
+                return True, "🎉 抽奖成功 (今日次数已用完)", detail, json.dumps(result, ensure_ascii=False), True
+            return True, "🎉 抽奖成功", detail, json.dumps(result, ensure_ascii=False), False
+        return True, "🎉 签到成功", "恭喜获得签到奖励！", json.dumps(result, ensure_ascii=False), False
         
-    # 2. 当天抽奖次数已用完 (已签满 2 次) -> 触发当天停签标记
-    if "次数已用完" in msg or "已用完" in msg:
-        return False, "🛑 今日已完成全部签到", "今日免费抽奖次数已耗尽 (停止本日后续签到)", msg, True
+    msg_lower = msg.lower()
+    
+    if "已用完" in msg or "上限" in msg or "不足" in msg or "明日再来" in msg or "无次数" in msg:
+        return True, "✅ 今日转盘次数已达上限", "今日已完成 2 次抽奖签到", msg, True
         
-    # 3. 5小时冷却间隔中 (未满5小时)
-    if "5个" in msg or "5小时" in msg or "未满" in msg or "冷却" in msg:
-        return False, "⏳ 抽奖冷却中", "未满 5 小时冷却间隔 (下次巡检自动补签)", msg, False
+    if "频繁" in msg or "稍后" in msg or "冷却" in msg or "5小时" in msg or "5 小时" in msg:
+        return True, "⏳ 正在 5 小时冷却中", "抽奖间隔未到，已保持签到状态", msg, False
         
-    # 4. 登录失效 (被手机端顶号 / refreshToken失效)
-    if code in [401, 403] or "登录" in msg or "refreshToken" in msg or "token" in msg:
+    if "登录" in msg or "token" in msg_lower or "auth" in msg_lower or "401" in msg_lower or "重新登录" in msg:
         return False, "⚠️ 登录已失效 (手机端顶号)", "被手机端登录顶掉Session，请在电脑微信点开梦享玩完成授权", msg, False
         
-    # 5. 其他未成功情况
-    return False, "⚠️ 签到未成功", "未获取到奖励", msg if msg else str(result), False
+    return False, f"⚠️ 抽奖提示: {msg}", "未中奖或系统提示", msg, False
 
-def run_sign_workflow(round_count):
+# ======================= [5. QQ 邮箱独立通知发送] =======================
+def send_email_report(account_index, nickname, mobile, success, status_desc, prize_info, raw_msg=""):
+    """为指定账号发送独立的 HTML 签到结果报告邮件"""
+    if not SMTP_CONFIG.get("enabled"):
+        return
+        
+    sender = SMTP_CONFIG["sender_email"]
+    auth_code = SMTP_CONFIG["auth_code"]
+    receiver = SMTP_CONFIG["receiver_email"]
+    smtp_server = SMTP_CONFIG["smtp_server"]
+    smtp_port = SMTP_CONFIG["smtp_port"]
+    
+    now_str = time.strftime("%Y-%m-%d %H:%M:%S")
+    status_tag = "【签到成功】" if success else "【签到提醒】"
+    subject = f"{status_tag} 梦享玩账号{account_index}({nickname}) 转盘签到通知 ({time.strftime('%m-%d %H:%M')})"
+    
+    bg_color = "#4CAF50" if success else "#FF9800"
+    
+    html_content = f"""
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="utf-8"></head>
+    <body style="font-family: Arial, 'Microsoft YaHei', sans-serif; background-color: #f4f6f9; margin: 0; padding: 20px;">
+      <div style="max-width: 600px; margin: 0 auto; background: #ffffff; border-radius: 12px; overflow: hidden; box-shadow: 0 4px 15px rgba(0,0,0,0.08);">
+        <div style="background-color: {bg_color}; padding: 22px; text-align: center; color: white;">
+          <h2 style="margin: 0; font-size: 20px;">梦享玩小程序 · 自动转盘签到报告</h2>
+          <p style="margin: 5px 0 0 0; font-size: 13px; opacity: 0.9;">双账号独立调度 · 每 5 小时自动巡检</p>
+        </div>
+        <div style="padding: 25px;">
+          <table style="width: 100%; border-collapse: collapse; font-size: 14px;">
+            <tr style="border-bottom: 1px solid #f0f0f0;">
+              <td style="padding: 10px 0; color: #888; width: 90px;">账号序号</td>
+              <td style="padding: 10px 0; font-weight: bold; color: #333;">账号 {account_index}</td>
+            </tr>
+            <tr style="border-bottom: 1px solid #f0f0f0;">
+              <td style="padding: 10px 0; color: #888;">账号名称</td>
+              <td style="padding: 10px 0; font-weight: bold; color: #333;">{nickname}</td>
+            </tr>
+            <tr style="border-bottom: 1px solid #f0f0f0;">
+              <td style="padding: 10px 0; color: #888;">绑定手机</td>
+              <td style="padding: 10px 0; color: #555;">{mobile or '未绑定/微信授权'}</td>
+            </tr>
+            <tr style="border-bottom: 1px solid #f0f0f0;">
+              <td style="padding: 10px 0; color: #888;">执行状态</td>
+              <td style="padding: 10px 0; font-weight: bold; color: {'#2e7d32' if success else '#e65100'};">{status_desc}</td>
+            </tr>
+            <tr style="border-bottom: 1px solid #f0f0f0;">
+              <td style="padding: 10px 0; color: #888;">奖品详情</td>
+              <td style="padding: 10px 0; font-weight: bold; color: #d84315;">{prize_info}</td>
+            </tr>
+            <tr>
+              <td style="padding: 10px 0; color: #888;">执行时间</td>
+              <td style="padding: 10px 0; color: #666;">{now_str}</td>
+            </tr>
+          </table>
+          <div style="margin-top: 20px; padding: 12px; background: #fafafa; border-radius: 6px; font-size: 12px; color: #999; word-break: break-all;">
+            <b>服务器原始反馈:</b> {raw_msg}
+          </div>
+        </div>
+        <div style="background: #fafafa; padding: 12px; text-align: center; font-size: 12px; color: #aaa; border-top: 1px solid #eee;">
+          微信小程序全自动签到助手 · 自动化守护中
+        </div>
+      </div>
+    </body>
+    </html>
+    """
+    
+    msg = MIMEMultipart('alternative')
+    msg['From'] = Header(f"梦享玩签到助手 <{sender}>", 'utf-8')
+    msg['To'] = Header(receiver, 'utf-8')
+    msg['Subject'] = Header(subject, 'utf-8')
+    msg.attach(MIMEText(html_content, 'html', 'utf-8'))
+    
+    try:
+        if SMTP_CONFIG.get("use_ssl", True):
+            server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=10)
+        else:
+            server = smtplib.SMTP(smtp_server, smtp_port, timeout=10)
+            server.starttls()
+        server.login(sender, auth_code)
+        server.sendmail(sender, [receiver], msg.as_string())
+        server.quit()
+        app_logger.info(f"📧 [邮件已发送] 账号 {account_index}({nickname}) 结果已送达 {receiver}")
+    except Exception as e:
+        app_logger.error(f"❌ 账号 {account_index} 邮件发送失败: {e}")
+
+# ======================= [6. 单轮签到核心调度流程] =======================
+def run_sign_workflow(round_count=1):
+    """执行一轮双账号的自愈与签到逻辑"""
     app_logger.info(f"================ 开始执行第 {round_count} 轮双账号转盘签到 ================")
     accounts = load_accounts()
     today_str = time.strftime("%Y-%m-%d")
     
-    # 检查账号数量及有效性
-    for acc_key, info in list(accounts.items()):
-        # 如果当天已经签满，无需强制重登
-        if info.get("daily_completed_date") == today_str:
-            continue
-            
-        token = info.get("token")
-        if not test_token_valid(token):
-            app_logger.warning(f"⚠️ 账号 [{info.get('nickname', acc_key)}] Token 无效，尝试静默刷新...")
-            refreshed_data = try_refresh_token(info.get("refreshToken"))
-            if refreshed_data and refreshed_data.get("token"):
-                info["token"] = refreshed_data.get("token")
-                if refreshed_data.get("refreshToken"):
-                    info["refreshToken"] = refreshed_data.get("refreshToken")
-                save_account(info, acc_key=acc_key)
-                app_logger.info(f"✅ 账号 [{info.get('nickname', acc_key)}] 静默刷新 Token 成功！")
-            else:
-                app_logger.warning(f"⚠️ 账号 [{info.get('nickname', acc_key)}] 静默刷新失败，正在触发窗口自愈重登...")
-                trigger_dual_wechat_relogin(acc_key)
-
-    accounts = load_accounts()
-    if not accounts:
-        app_logger.error("❌ 未能获取到任何有效账号，本次签到跳过。")
-        return
-
-    # 遍历每个账号执行签到并独立发信
-    for idx, (acc_key, info) in enumerate(accounts.items(), start=1):
-        nickname = info.get("nickname", f"用户{idx}")
-        mobile = str(info.get("mobile", acc_key))
-        token = info.get("token")
+    acc_keys = list(accounts.keys())
+    if len(acc_keys) < 2:
+        for default_k in ["weixin252121438", "weixin2"]:
+            if default_k not in acc_keys:
+                acc_keys.append(default_k)
+                
+    for idx, acc_key in enumerate(acc_keys[:2], start=1):
+        info = accounts.get(acc_key, {})
+        nickname = get_account_identity_name(acc_key, info)
+        mobile = info.get("mobile") or nickname
+        token = info.get("token") or ""
+        refresh_token = info.get("refreshToken") or ""
+        daily_date = info.get("daily_completed_date") or ""
         
-        # 检查该账号今天是否已经完成全部抽奖
-        if info.get("daily_completed_date") == today_str:
-            app_logger.info(f"⏭️ 账号 {idx} [{nickname}] 今日抽奖次数已用完，跳过本日后续执行。")
+        # 1. 检查今日是否已满次数
+        if daily_date == today_str:
+            app_logger.info(f"⏭️ 账号 {idx} [{nickname}] 今日次数已达上限，智能跳过本次请求。")
             continue
             
-        if not token:
-            app_logger.warning(f"⚠️ 账号 {idx} [{nickname}] 缺少 Token，跳过签到。")
-            continue
+        # 2. 验证 Token 是否有效
+        is_valid = False
+        if token:
+            is_valid, _ = test_token_valid(token)
             
-        app_logger.info(f"🎯 正在为账号 {idx} [{nickname} ({mobile})] 执行转盘抽奖...")
+        # 3. 若 Token 失效，先尝试 RefreshToken 静默续期
+        if not is_valid and refresh_token:
+            app_logger.info(f"🔄 账号 [{nickname}] Token 无效，尝试静默刷新...")
+            refreshed = try_refresh_token(refresh_token)
+            if refreshed:
+                token, refresh_token = refreshed
+                info["token"] = token
+                info["refreshToken"] = refresh_token
+                save_account(info, acc_key=acc_key)
+                is_valid, _ = test_token_valid(token)
+                if is_valid:
+                    app_logger.info(f"✅ 账号 [{nickname}] 静默刷新成功！")
+                    
+        # 4. 若仍失效，触发窗口自愈唤醒
+        if not is_valid:
+            app_logger.warning(f"⚠️ 账号 [{nickname}] Token 失效（手机端顶号），正在执行全自动自愈拉起...")
+            activate_and_open_miniapp(nickname)
+            new_token = scan_memory_for_valid_tokens(target_acc_key=acc_key, max_wait_sec=15)
+            if new_token:
+                token = new_token
+                accounts = load_accounts()
+                info = accounts.get(acc_key, {})
+                
+        # 5. 执行转盘抽奖
+        app_logger.info(f"🎯 正在为账号 {idx} [{nickname}] 执行转盘抽奖...")
         result = play_turntable(token)
         
-        # 如果抽奖返回“请登录后再操作”，触发就地自愈再重试一次
-        if result.get("code") in [401, 403] or "登录" in str(result.get("msg", "")):
+        # 6. 若接口提示需要登录，进行二次自愈重试
+        raw_msg_str = str(result.get("msg") or result.get("message") or "")
+        if "登录" in raw_msg_str or result.get("code") in [401, 403]:
             app_logger.warning(f"⚠️ 账号 {idx} [{nickname}] 抽奖反馈需重新登录，立即触发窗口自愈重试...")
-            trigger_dual_wechat_relogin(acc_key)
-            fresh_accs = load_accounts()
-            if fresh_accs.get(acc_key, {}).get("token"):
+            activate_and_open_miniapp(nickname)
+            new_token = scan_memory_for_valid_tokens(target_acc_key=acc_key, max_wait_sec=15)
+            if new_token:
+                fresh_accs = load_accounts()
                 token = fresh_accs[acc_key]["token"]
                 result = play_turntable(token)
                 
         success, status_desc, prize_desc, raw_msg, is_daily_finished = parse_prize_info(result)
         app_logger.info(f"[{nickname}] 转盘结果: {status_desc} | {prize_desc} | 原始响应: {raw_msg}")
         
-        # 如果当天次数用完，记录完成日期以停止今天后续的请求
+        # 如果当天次数用完，记录完成日期
         if is_daily_finished:
             info["daily_completed_date"] = today_str
             save_account(info, acc_key=acc_key)
@@ -933,24 +836,23 @@ def run_sign_workflow(round_count):
         
     app_logger.info(f"================ 第 {round_count} 轮签到任务执行完毕 ================")
 
-# ======================= [5. 程序主入口 & 定时调度] =======================
+# ======================= [7. 程序主入口 & 定时调度] =======================
 def main():
     print("=" * 65)
     print("   微信小程序双开全自动自愈签到助手 (每5小时循环 + QQ邮箱独立通知)   ")
     print("=" * 65)
     
-    # 确保网络环境干净，绝不残留代理导致小程序白屏
-    set_system_proxy(False)
-    atexit.register(lambda: set_system_proxy(False))
+    # 确保网络环境干净，绝不残留任何系统代理
+    set_system_proxy(enable=False)
+    atexit.register(lambda: set_system_proxy(enable=False))
     
-    # 1. 启动内嵌抓包代理
-    proxy_thread = threading.Thread(target=start_embedded_proxy, daemon=True)
-    proxy_thread.start()
-    time.sleep(2)
+    # 启动后台实时内存 Token 捕获守护线程
+    start_background_memory_harvester()
+    app_logger.info("✅ 毫秒级内存 Token 捕获守护线程已启动 (免代理/零断网/零白屏)")
     
     round_idx = 1
     
-    # 2. 循环执行
+    # 循环执行
     try:
         while True:
             try:
