@@ -275,6 +275,24 @@ def activate_and_open_miniapp(hwnd, pid, index, acc_key=""):
     except Exception as e:
         app_logger.error(f"激活微信窗口失败: {e}")
 
+def clear_applet_local_storage(acc_idx):
+    """清理对应微信账号的小程序本地缓存，确保冷启动强制重新向服务端申请有效认证"""
+    user_hashes = [
+        "25f8fed23027fedab032d1210dba1c1a", # 账号 1 (weixin252121438 / wxid_4mbyafbboci822)
+        "bd658851ea3dee19ebe55b06e1401262"  # 账号 2 (weixin2 / xinwu2953)
+    ]
+    if 1 <= acc_idx <= len(user_hashes):
+        uhash = user_hashes[acc_idx - 1]
+        base_dir = fr"C:\Users\wangxw\AppData\Roaming\Tencent\xwechat\radium\Applet\{uhash}\local\wx44a67f9e199a46d0"
+        for sub in ["usrmmkvstorage0", "usrmmkvstorage1", "temp"]:
+            target_p = os.path.join(base_dir, sub)
+            if os.path.exists(target_p):
+                try:
+                    shutil.rmtree(target_p)
+                    app_logger.info(f"🧹 已重置账号 {acc_idx} 本地小程序存储缓存: {sub}")
+                except Exception as e:
+                    app_logger.warning(f"⚠️ 清理本地存储缓存异常: {e}")
+
 def trigger_dual_wechat_relogin(target_acc_key=None):
     """
     自愈唤醒微信并抓包最新 Token
@@ -302,35 +320,17 @@ def trigger_dual_wechat_relogin(target_acc_key=None):
         for idx, pid in enumerate(sorted_pids[:2], start=1):
             target_tasks.append((pid, windows_map[pid], idx, acc_keys[idx-1] if idx-1 < len(acc_keys) else f"acc_{idx}"))
             
+    # 先清理旧的 WeChatAppEx 进程，重置网络运行环境
+    subprocess.run("taskkill /F /IM WeChatAppEx.exe", shell=True, capture_output=True)
+    time.sleep(1.0)
+    
     for pid, info, idx, acc_key in target_tasks:
         current_relogin_target_account = acc_key
         
-        # 先尝试唤醒已存在的小程序窗口并刷新
-        app_logger.info(f"🔄 [通道1] 检查账号 {idx} [{acc_key}] 的小程序后台窗口并尝试就地刷新...")
-        refreshed = False
-        for p in psutil.process_iter(['pid', 'name']):
-            if 'wechatappex' in (p.info['name'] or '').lower():
-                try:
-                    for t in p.threads():
-                        def appex_enum(h, lp):
-                            nonlocal refreshed
-                            buf = ctypes.create_unicode_buffer(256)
-                            user32.GetClassNameW(h, buf, 256)
-                            if buf.value == 'Chrome_WidgetWin_0':
-                                user32.ShowWindow(h, 9) # SW_RESTORE
-                                user32.ShowWindow(h, 5) # SW_SHOW
-                                user32.SetForegroundWindow(h)
-                                user32.BringWindowToTop(h)
-                                user32.PostMessageW(h, 0x0100, 0x74, 0) # WM_KEYDOWN VK_F5
-                                time.sleep(0.05)
-                                user32.PostMessageW(h, 0x0101, 0x74, 0) # WM_KEYUP VK_F5
-                                refreshed = True
-                            return True
-                        user32.EnumThreadWindows(t.id, ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)(appex_enum), 0)
-                except Exception:
-                    pass
+        # 1. 深度清理本地可能残留的过期 Token 缓存，避免小程序重复发送旧凭证
+        clear_applet_local_storage(idx)
                     
-        # 通道2：通过主微信窗口搜索唤醒
+        # 2. 通过主微信窗口定位并拉起小程序
         activate_and_open_miniapp(info['hwnd'], pid, idx, acc_key)
         
         app_logger.info(f"⏳ 正在为账号 {idx} [{acc_key}] 监控抓包最新 Token (最多等待 12 秒)...")
@@ -705,7 +705,11 @@ def parse_prize_info(result):
     if "5个" in msg or "5小时" in msg or "未满" in msg or "冷却" in msg:
         return False, "⏳ 抽奖冷却中", "未满 5 小时冷却间隔 (下次巡检自动补签)", msg, False
         
-    # 4. 其他未成功情况
+    # 4. 登录失效 (被手机端顶号 / refreshToken失效)
+    if code in [401, 403] or "登录" in msg or "refreshToken" in msg or "token" in msg:
+        return False, "⚠️ 登录已失效 (手机端顶号)", "被手机端登录顶掉Session，请在电脑微信点开梦享玩完成授权", msg, False
+        
+    # 5. 其他未成功情况
     return False, "⚠️ 签到未成功", "未获取到奖励", msg if msg else str(result), False
 
 def run_sign_workflow(round_count):
