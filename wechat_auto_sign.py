@@ -84,14 +84,23 @@ http_client = requests.Session()
 http_client.trust_env = False
 http_client.verify = False
 
-# 独立日志记录器
+# 独立日志记录器 (带实时行刷新与文件持久化)
 app_logger = logging.getLogger("wechat_sign_app")
 app_logger.setLevel(logging.INFO)
 app_logger.propagate = False
 if not app_logger.handlers:
-    sh = logging.StreamHandler(sys.stdout)
-    sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    class FlushStreamHandler(logging.StreamHandler):
+        def emit(self, record):
+            super().emit(record)
+            self.flush()
+    sh = FlushStreamHandler(sys.stdout)
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+    sh.setFormatter(fmt)
     app_logger.addHandler(sh)
+    
+    fh = logging.FileHandler(os.path.join(BASE_DIR, "auto_sign.log"), encoding="utf-8")
+    fh.setFormatter(fmt)
+    app_logger.addHandler(fh)
 
 # 全局自愈目标账号与文件锁
 current_relogin_target_account = None
@@ -160,19 +169,18 @@ def set_system_proxy(enable=True, host="127.0.0.1", port=8888):
 
 def get_main_wechat_windows():
     """高精度定位运行中微信实例的主聊天窗口 (过滤托盘及辅助子窗口)"""
-    try:
-        h_desk = user32.OpenDesktopW("default", 0, False, 0x01FF)
-        if h_desk:
-            user32.SetThreadDesktop(h_desk)
-    except Exception:
-        pass
+    h_desk = user32.OpenInputDesktop(0, False, 0x01FF)
+    if not h_desk:
+        h_desk = user32.OpenDesktopW("Default", 0, False, 0x01FF)
+    if h_desk:
+        user32.SetThreadDesktop(h_desk)
 
     pid_windows = {}
     WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)
     
     def enum_cb(hwnd, lparam):
         try:
-            if not user32.IsWindow(hwnd):
+            if not user32.IsWindowVisible(hwnd):
                 return True
             pid = ctypes.wintypes.DWORD()
             user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
@@ -183,28 +191,25 @@ def get_main_wechat_windows():
             user32.GetClassNameW(hwnd, buf_cls, 256)
             cls = buf_cls.value
             
-            if cls in ["Qt51514QWindowIcon", "WeChatMainWndForPC"] and user32.GetParent(hwnd) == 0:
-                wp = WINDOWPLACEMENT()
-                wp.length = ctypes.sizeof(wp)
-                user32.GetWindowPlacement(hwnd, ctypes.byref(wp))
-                r = wp.rcNormalPosition
-                area = (r.right - r.left) * (r.bottom - r.top)
-                # 过滤小于100,000像素的托盘弹窗，精准锁定主窗口
-                if area > 100000:
-                    if pid.value not in pid_windows or area > pid_windows[pid.value]['area']:
-                        pid_windows[pid.value] = {
-                            'hwnd': hwnd,
-                            'pid': pid.value,
-                            'cls': cls,
-                            'area': area,
-                            'rect': (r.left, r.top, r.right, r.bottom)
-                        }
+            if cls in ["Qt51514QWindowIcon", "WeChatMainWndForPC"]:
+                rect = ctypes.wintypes.RECT()
+                user32.GetWindowRect(hwnd, ctypes.byref(rect))
+                w = rect.right - rect.left
+                h = rect.bottom - rect.top
+                if w > 400 and h > 400:
+                    pid_windows[pid.value] = {
+                        'hwnd': hwnd,
+                        'pid': pid.value,
+                        'cls': cls,
+                        'area': w * h,
+                        'rect': (rect.left, rect.top, rect.right, rect.bottom)
+                    }
         except Exception:
             pass
         return True
 
     cb = WNDENUMPROC(enum_cb)
-    user32.EnumWindows(cb, 0)
+    user32.EnumDesktopWindows(h_desk, cb, 0)
     return pid_windows
 
 def click_screen(x, y):
@@ -250,6 +255,12 @@ def activate_and_open_miniapp(hwnd, pid, index, acc_key=""):
     """激活指定微信主窗口并通过原生搜索唤醒打开小程序，自动模拟授权登录"""
     try:
         set_system_proxy(False)
+        h_desk = user32.OpenInputDesktop(0, False, 0x01FF)
+        if not h_desk:
+            h_desk = user32.OpenDesktopW("Default", 0, False, 0x01FF)
+        if h_desk:
+            user32.SetThreadDesktop(h_desk)
+            
         cur_thread = kernel32.GetCurrentThreadId()
         target_thread = user32.GetWindowThreadProcessId(hwnd, None)
         if cur_thread != target_thread and target_thread != 0:
@@ -622,46 +633,52 @@ def handle_intercepted_token(token, refresh_token=None):
     })
 
 def scan_memory_for_valid_tokens():
-    """直接扫描微信及小程序内存空间中的有效 JWT Token，无需依赖代理与网络驱动"""
+    """直接扫描微信小程序进程 (WeChatAppEx.exe) 内存空间中的有效 JWT Token，极速提取"""
     found_tokens = []
-    for p in psutil.process_iter(['pid', 'name']):
-        name = (p.info['name'] or '').lower()
-        if 'wechatappex' in name or 'weixin' in name:
-            pid = p.info['pid']
-            h_proc = kernel32.OpenProcess(0x0010 | 0x0400, False, pid)
-            if not h_proc:
-                continue
-            mbi = (ctypes.c_void_p * 7)()
-            addr = 0
-            buf = ctypes.create_string_buffer(65536)
-            bread = ctypes.c_size_t()
-            while kernel32.VirtualQueryEx(h_proc, ctypes.c_void_p(addr), ctypes.byref(mbi), 48):
-                base = mbi[0] or 0
-                size = mbi[3] or 0
-                state = mbi[4] or 0
-                protect = mbi[5] or 0
-                if state == 0x1000 and (protect & 0x04):
-                    curr = base
-                    end = base + size
-                    while curr < end:
-                        chunk = min(65536, end - curr)
-                        if kernel32.ReadProcessMemory(h_proc, ctypes.c_void_p(curr), buf, chunk, ctypes.byref(bread)):
-                            data = buf.raw[:bread.value]
-                            if b'eyJhbGciOi' in data:
-                                matches = re.findall(rb'eyJhbGciOi[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+', data)
-                                for m in matches:
-                                    try:
-                                        cand = m.decode('utf-8')
-                                        if cand not in found_tokens:
-                                            if test_token_valid(cand):
-                                                found_tokens.append(cand)
-                                    except Exception:
-                                        pass
-                        curr += chunk
-                addr = base + size
-                if addr >= 0x7FFFFFFF0000:
-                    break
-            kernel32.CloseHandle(h_proc)
+    buf = ctypes.create_string_buffer(262144)
+    bread = ctypes.c_size_t()
+    mbi = (ctypes.c_void_p * 7)()
+    
+    # 仅扫描小程序渲染和主进程 WeChatAppEx.exe
+    target_pids = [
+        p.info['pid'] for p in psutil.process_iter(['pid', 'name'])
+        if 'wechatappex' in (p.info['name'] or '').lower()
+    ]
+    
+    for pid in target_pids:
+        h_proc = kernel32.OpenProcess(0x0010 | 0x0400, False, pid)
+        if not h_proc:
+            continue
+        addr = 0
+        while kernel32.VirtualQueryEx(h_proc, ctypes.c_void_p(addr), ctypes.byref(mbi), 48):
+            base = mbi[0] or 0
+            size = mbi[3] or 0
+            state = mbi[4] or 0
+            protect = mbi[5] or 0
+            # 只扫描已提交、可读写的私有/映射内存
+            if state == 0x1000 and (protect & 0x04) and size <= 32 * 1024 * 1024:
+                curr = base
+                end = base + size
+                while curr < end:
+                    chunk = min(262144, end - curr)
+                    if kernel32.ReadProcessMemory(h_proc, ctypes.c_void_p(curr), buf, chunk, ctypes.byref(bread)):
+                        data = buf.raw[:bread.value]
+                        if b'eyJhbGciOi' in data:
+                            for m in re.finditer(rb'eyJhbGciOi[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+', data):
+                                try:
+                                    cand = m.group(0).decode('utf-8', errors='ignore')
+                                    if cand not in found_tokens:
+                                        if test_token_valid(cand):
+                                            found_tokens.append(cand)
+                                            kernel32.CloseHandle(h_proc)
+                                            return found_tokens
+                                except Exception:
+                                    pass
+                    curr += chunk
+            addr = base + size
+            if addr >= 0x00007FFFFFFF0000:
+                break
+        kernel32.CloseHandle(h_proc)
     return found_tokens
 
 # ======================= [3. 内嵌 Mitmproxy 抓包代理服务] =======================
@@ -721,12 +738,15 @@ def start_embedded_proxy():
 # ======================= [4. 业务请求与自动签到 (带智能响应解析 & 当日上限停签)] =======================
 def test_token_valid(token):
     """测试 Token 是否有效 (带多次网络重试机制)"""
-    if not token:
+    if not token or len(token) < 20:
         return False
     url = f"{BASE_URL}/turntable/paying/info"
     headers = {
         "User-Agent": USER_AGENT,
+        "token": token,
         "Authorization": f"Bearer {token}",
+        "shopId": str(SHOP_ID),
+        "appId": APP_ID,
         "Content-Type": "application/x-www-form-urlencoded",
         "Referer": "https://servicewechat.com/wx44a67f9e199a46d0/221/page-frame.html"
     }
@@ -748,7 +768,7 @@ def try_refresh_token(refresh_token):
     """尝试使用 refreshToken 静默刷新 token (带多次网络重试机制)"""
     if not refresh_token:
         return None
-    url = f"{BASE_URL}/token/refresh"
+    url = f"{BASE_URL}/wechat/auth/refreshToken"
     headers = {
         "User-Agent": USER_AGENT,
         "Content-Type": "application/x-www-form-urlencoded",
@@ -757,7 +777,7 @@ def try_refresh_token(refresh_token):
     }
     for attempt in range(1, MAX_NETWORK_RETRIES + 1):
         try:
-            r = http_client.post(url, data={"refreshToken": refresh_token}, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
+            r = http_client.get(url, params={"refreshToken": refresh_token}, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
             if r.status_code == 200:
                 res = r.json()
                 if res.get("code") == 200 and "data" in res:
@@ -765,7 +785,7 @@ def try_refresh_token(refresh_token):
                 else:
                     app_logger.warning(f"⚠️ 刷新 Token 服务端响应: {res.get('msg')}")
                     return None
-            elif r.status_code in [401, 403, 409]:
+            elif r.status_code in [401, 403, 404, 409]:
                 app_logger.warning(f"⚠️ RefreshToken 已在服务端失效 (状态码 {r.status_code})")
                 return None
         except Exception as e:
@@ -779,7 +799,10 @@ def play_turntable(token):
     url = f"{BASE_URL}/turntable/play/mp/new"
     headers = {
         "User-Agent": USER_AGENT,
+        "token": token,
         "Authorization": f"Bearer {token}",
+        "shopId": str(SHOP_ID),
+        "appId": APP_ID,
         "Content-Type": "application/x-www-form-urlencoded",
         "Referer": "https://servicewechat.com/wx44a67f9e199a46d0/221/page-frame.html",
         "xweb_xhr": "1"
