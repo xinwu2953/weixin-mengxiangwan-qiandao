@@ -23,6 +23,7 @@ import subprocess
 import ctypes
 from ctypes import wintypes
 import winreg
+import atexit
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import Header
@@ -213,8 +214,39 @@ def click_screen(x, y):
     user32.mouse_event(0x0004, 0, 0, 0, 0)
     time.sleep(0.1)
 
+def find_applet_window():
+    """查找当前运行中梦享玩小程序窗口"""
+    h_desk = user32.OpenInputDesktop(0, False, 0x01FF)
+    if not h_desk:
+        h_desk = user32.OpenDesktopW("Default", 0, False, 0x01FF)
+    user32.SetThreadDesktop(h_desk)
+    
+    applet_hwnds = []
+    WNDENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+    def enum_cb(h, lparam):
+        if user32.IsWindowVisible(h):
+            pid = wintypes.DWORD()
+            user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+            try:
+                p = psutil.Process(pid.value)
+                if 'wechatappex' in p.name().lower():
+                    buf_title = ctypes.create_unicode_buffer(512)
+                    user32.GetWindowTextW(h, buf_title, 512)
+                    rect = wintypes.RECT()
+                    user32.GetWindowRect(h, ctypes.byref(rect))
+                    w = rect.right - rect.left
+                    h_val = rect.bottom - rect.top
+                    if w > 200 and h_val > 200:
+                        applet_hwnds.append((h, pid.value, buf_title.value, rect))
+            except:
+                pass
+        return True
+    
+    user32.EnumDesktopWindows(h_desk, WNDENUMPROC(enum_cb), 0)
+    return applet_hwnds
+
 def activate_and_open_miniapp(hwnd, pid, index, acc_key=""):
-    """激活指定微信主窗口并通过原生搜索唤醒打开小程序"""
+    """激活指定微信主窗口并通过原生搜索唤醒打开小程序，自动模拟授权登录"""
     try:
         set_system_proxy(False)
         cur_thread = kernel32.GetCurrentThreadId()
@@ -274,7 +306,34 @@ def activate_and_open_miniapp(hwnd, pid, index, acc_key=""):
         user32.keybd_event(0x0D, 0, 0, 0) # Enter
         time.sleep(0.08)
         user32.keybd_event(0x0D, 0, 2, 0)
-        time.sleep(2.0)
+        time.sleep(3.5)
+        
+        # 5. 定位并前置小程序窗口，执行界面授权触控
+        applets = find_applet_window()
+        if applets:
+            app_h = applets[0][0]
+            user32.ShowWindow(app_h, 9)
+            user32.ShowWindow(app_h, 5)
+            user32.SetWindowPos(app_h, -1, 200, 100, 500, 800, 0x0040)
+            user32.SetForegroundWindow(app_h)
+            time.sleep(0.8)
+            
+            app_logger.info(f"🖱️ 正在小程序界面模拟点击触发授权登录...")
+            # 点击“我的”触发授权检查 (screen x=200+350=550, y=100+730=830)
+            user32.SetCursorPos(550, 830)
+            time.sleep(0.1)
+            user32.mouse_event(0x0002, 0, 0, 0, 0)
+            time.sleep(0.08)
+            user32.mouse_event(0x0004, 0, 0, 0, 0)
+            time.sleep(1.0)
+            
+            # 点击“每日转盘” (screen x=200+265=465, y=100+360=460)
+            user32.SetCursorPos(465, 460)
+            time.sleep(0.1)
+            user32.mouse_event(0x0002, 0, 0, 0, 0)
+            time.sleep(0.08)
+            user32.mouse_event(0x0004, 0, 0, 0, 0)
+            time.sleep(1.5)
     except Exception as e:
         app_logger.error(f"激活微信窗口失败: {e}")
 
@@ -323,6 +382,14 @@ def trigger_dual_wechat_relogin(target_acc_key=None):
             if test_token_valid(cur_tok):
                 app_logger.info(f"✅ 账号 {idx} [{acc_key}] 成功自愈获取有效 Token！")
                 break
+                
+        # 抓取完成后关闭小程序窗口
+        applets = find_applet_window()
+        for ah, apid, atitle, arect in applets:
+            try:
+                user32.PostMessageW(ah, 0x0010, 0, 0) # WM_CLOSE
+            except:
+                pass
         time.sleep(1.5)
         
     current_relogin_target_account = None
@@ -530,45 +597,47 @@ from mitmproxy.tools.dump import DumpMaster
 
 class MiniAppInterceptor:
     def request(self, flow: http.HTTPFlow) -> None:
-        # 拦截发往 mongoose.liangjingkeji.com 的请求头 Authorization
         if "mongoose.liangjingkeji.com" in flow.request.pretty_url:
-            auth = flow.request.headers.get("Authorization", "")
-            if auth.startswith("Bearer "):
-                token = auth.split("Bearer ")[1].strip()
-                if token:
-                    threading.Thread(target=handle_intercepted_token, args=(token,), daemon=True).start()
+            tok = flow.request.headers.get("token", "") or flow.request.headers.get("Authorization", "")
+            if tok.startswith("Bearer "):
+                tok = tok.split("Bearer ")[1].strip()
+            if tok and len(tok) >= 20:
+                app_logger.info(f"🎯 [抓包拦截] 从请求头捕获到有效 Token: {tok[:10]}***")
+                threading.Thread(target=handle_intercepted_token, args=(tok,), daemon=True).start()
 
     def response(self, flow: http.HTTPFlow) -> None:
-        # 拦截 /wx/mp/login 登录响应
-        if "mongoose.liangjingkeji.com/wx/mp/login" in flow.request.pretty_url:
+        if "mongoose.liangjingkeji.com" in flow.request.pretty_url:
             try:
                 res = json.loads(flow.response.text)
-                if res.get("code") == 200 and "data" in res:
-                    tok = res["data"].get("token")
-                    rt = res["data"].get("refreshToken")
-                    if tok:
-                        threading.Thread(target=handle_intercepted_token, args=(tok, rt), daemon=True).start()
-            except Exception as e:
-                app_logger.error(f"解析登录响应失败: {e}")
-        # 拦截 token refresh 响应
-        elif "mongoose.liangjingkeji.com/token/refresh" in flow.request.pretty_url:
-            try:
-                res = json.loads(flow.response.text)
-                if res.get("code") == 200 and "data" in res:
-                    tok = res["data"].get("token")
-                    rt = res["data"].get("refreshToken")
-                    if tok:
-                        threading.Thread(target=handle_intercepted_token, args=(tok, rt), daemon=True).start()
+                data = res.get("data")
+                tok = None
+                rt = None
+                if isinstance(data, dict):
+                    tok = data.get("token") or data.get("accessToken")
+                    rt = data.get("refreshToken")
+                elif isinstance(data, str) and len(data) >= 20:
+                    tok = data
+                    
+                if tok:
+                    app_logger.info(f"🎯 [抓包拦截] 从服务端响应捕获到全新 Token: {tok[:10]}***")
+                    threading.Thread(target=handle_intercepted_token, args=(tok, rt), daemon=True).start()
             except Exception:
                 pass
 
 async def _run_proxy_async(port):
-    opts = options.Options(
-        listen_host="127.0.0.1",
-        listen_port=port,
-        ssl_insecure=True,
-        ignore_hosts=[r"^(?!.*mongoose\.liangjingkeji\.com).*"]
-    )
+    try:
+        opts = options.Options(
+            mode=[f"regular@{port}", "local:WeChatAppEx.exe", "local:Weixin.exe"],
+            listen_host="127.0.0.1",
+            listen_port=port,
+            ssl_insecure=True,
+        )
+    except Exception:
+        opts = options.Options(
+            listen_host="127.0.0.1",
+            listen_port=port,
+            ssl_insecure=True,
+        )
     master = DumpMaster(opts, with_termlog=False, with_dumper=False)
     master.addons.add(MiniAppInterceptor())
     app_logger.info(f"✅ 内嵌抓包代理服务已就绪 (监听端口: {port})")
@@ -580,7 +649,9 @@ def start_embedded_proxy():
     try:
         asyncio.run(_run_proxy_async(PROXY_PORT))
     except Exception as e:
-        app_logger.error(f"代理运行异常: {e}")
+        app_logger.error(f"内嵌代理异常退出: {e}")
+    finally:
+        set_system_proxy(enable=False)
 
 # ======================= [4. 业务请求与自动签到 (带智能响应解析 & 当日上限停签)] =======================
 def test_token_valid(token):
