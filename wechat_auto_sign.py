@@ -1,28 +1,34 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微信小程序双账号自愈转盘签到助手 (单文件免配置版 - 每5小时循环 + 智能响应解析 + 当日上限自动停签 + 独立QQ邮件推送)
-支持直接使用 PyInstaller 打包为单文件 exe
+微信小程序【梦享玩】全自动签到与自愈脚本 (双账号支持 + 定时循环 + 独立QQ邮箱通知)
+- 智能内嵌抓包：拦截 Bearer Token 及 RefreshToken 并自动绑定到对应账号
+- 定向抓包放行：仅拦截目标接口，官方资源直连，避免 SSL 冲突
+- 双账号原生界面自愈：自动清理旧小程序进程冷启动，模拟搜索唤醒小程序，无系统权限弹窗
+- 智能签到解析：精准识别【已完成全部签到 / 5小时冷却 / 获得游戏币 / 实物奖励】
+- 当日上限停签：当天满2次自动记录，本日后续巡检智能跳过
+- 邮件独立发送：每个账号单独发送美化 HTML 邮件通知
 """
+
 import os
 import sys
 import time
 import json
-import base64
+import socket
 import logging
-import threading
 import asyncio
+import threading
 import smtplib
 import subprocess
-import winreg
-import socket
 import ctypes
-import ctypes.wintypes
+from ctypes import wintypes
+import winreg
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from email.header import Header
-import urllib3
+
 import requests
+import urllib3
 import psutil
 import pyperclip
 
@@ -76,7 +82,7 @@ http_client = requests.Session()
 http_client.trust_env = False
 http_client.verify = False
 
-# 独立日志记录器，避免与 mitmproxy 的 root handler 耦合
+# 独立日志记录器
 app_logger = logging.getLogger("wechat_sign_app")
 app_logger.setLevel(logging.INFO)
 app_logger.propagate = False
@@ -84,6 +90,10 @@ if not app_logger.handlers:
     sh = logging.StreamHandler(sys.stdout)
     sh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     app_logger.addHandler(sh)
+
+# 全局自愈目标账号与文件锁
+current_relogin_target_account = None
+db_lock = threading.Lock()
 
 # ======================= [端口检查与单实例保护] =======================
 def clean_port_conflict(port):
@@ -139,7 +149,7 @@ def set_system_proxy(enable=True, host="127.0.0.1", port=8888):
             winreg.SetValueEx(key, "ProxyEnable", 0, winreg.REG_DWORD, 0)
             app_logger.info("🌐 Windows 系统代理已还原 (禁用)")
         winreg.CloseKey(key)
-        
+
         internet_set_option = ctypes.windll.Wininet.InternetSetOptionW
         internet_set_option(0, INTERNET_OPTION_SETTINGS_CHANGED, 0, 0)
         internet_set_option(0, INTERNET_OPTION_REFRESH, 0, 0)
@@ -147,7 +157,7 @@ def set_system_proxy(enable=True, host="127.0.0.1", port=8888):
         app_logger.error(f"设置系统代理异常: {e}")
 
 def get_main_wechat_windows():
-    """高精度定位所有运行中微信实例的主聊天窗口 (过滤托盘及辅助子窗口)"""
+    """高精度定位运行中微信实例的主聊天窗口 (过滤托盘及辅助子窗口)"""
     try:
         h_desk = user32.OpenDesktopW("default", 0, False, 0x01FF)
         if h_desk:
@@ -203,7 +213,7 @@ def click_screen(x, y):
     user32.mouse_event(0x0004, 0, 0, 0, 0)
     time.sleep(0.1)
 
-def activate_and_open_miniapp(hwnd, pid, index):
+def activate_and_open_miniapp(hwnd, pid, index, acc_key=""):
     """激活指定微信主窗口并通过原生界面搜索打开小程序 (无任何Windows协议弹窗)"""
     try:
         cur_thread = kernel32.GetCurrentThreadId()
@@ -218,45 +228,95 @@ def activate_and_open_miniapp(hwnd, pid, index):
         if cur_thread != target_thread and target_thread != 0:
             user32.AttachThreadInput(cur_thread, target_thread, False)
         
-        time.sleep(0.8)
+        time.sleep(1.0)
         r = ctypes.wintypes.RECT()
         user32.GetWindowRect(hwnd, ctypes.byref(r))
         
-        app_logger.info(f"📱 正在为第 {index} 个微信 (HWND: {hwnd}, PID: {pid}) 搜索拉起'梦享玩'小程序...")
+        app_logger.info(f"📱 正在为第 {index} 个微信 [{acc_key}] (HWND: {hwnd}, PID: {pid}) 搜索拉起'梦享玩'小程序...")
         # 点击搜索框
         click_screen(r.left + 200, r.top + 35)
         time.sleep(0.5)
         
-        # 粘贴并回车
+        # 全选并清空可能残留的旧搜索词
+        user32.keybd_event(0x11, 0, 0, 0) # Ctrl
+        user32.keybd_event(0x41, 0, 0, 0) # A
+        time.sleep(0.05)
+        user32.keybd_event(0x41, 0, 2, 0)
+        user32.keybd_event(0x11, 0, 2, 0)
+        time.sleep(0.1)
+        user32.keybd_event(0x2E, 0, 0, 0) # Del
+        time.sleep(0.05)
+        user32.keybd_event(0x2E, 0, 2, 0)
+        time.sleep(0.2)
+        
+        # 粘贴“梦享玩”
         pyperclip.copy("梦享玩")
         user32.keybd_event(0x11, 0, 0, 0) # Ctrl
         user32.keybd_event(0x56, 0, 0, 0) # V
         time.sleep(0.08)
         user32.keybd_event(0x56, 0, 2, 0)
         user32.keybd_event(0x11, 0, 2, 0)
+        time.sleep(1.2) # 等待微信搜索下拉面板渲染出小程序项
+        
+        # 点击下拉项首个结果 (小程序图标行)
+        click_screen(r.left + 200, r.top + 100)
         time.sleep(1.0)
         
+        # 兜底：回车确认
         user32.keybd_event(0x0D, 0, 0, 0) # Enter
         time.sleep(0.08)
         user32.keybd_event(0x0D, 0, 2, 0)
-        time.sleep(1.5)
-        
-        # 点击首个搜索结果
-        click_screen(r.left + 200, r.top + 100)
-        time.sleep(3)
+        time.sleep(2.0)
     except Exception as e:
         app_logger.error(f"激活微信窗口失败: {e}")
 
-def trigger_dual_wechat_relogin():
-    """遍历所有微信多开实例依次唤醒并抓包"""
+def trigger_dual_wechat_relogin(target_acc_key=None):
+    """
+    自愈唤醒微信并抓包最新 Token
+    支持指定单个账号自愈（如 'weixin252121438' 或 'weixin2'），或全部自愈
+    """
+    global current_relogin_target_account
     windows_map = get_main_wechat_windows()
     if not windows_map:
         app_logger.error("❌ 未检测到运行中的微信主窗口，请确保微信多开正常挂在后台！")
         return False
-    app_logger.info(f"🔍 找到 {len(windows_map)} 个微信主窗口实例，开始依次自愈拉起...")
-    for idx, (pid, info) in enumerate(windows_map.items(), start=1):
-        activate_and_open_miniapp(info['hwnd'], pid, idx)
-        time.sleep(2)
+        
+    # 先清理旧的 WeChatAppEx.exe 进程，确保小程序强制冷启动发送登录与Token请求
+    app_logger.info("🧹 正在重置小程序后台运行态以确保冷启动抓取最新 Token...")
+    subprocess.run("taskkill /F /IM WeChatAppEx.exe", shell=True, capture_output=True)
+    time.sleep(1.5)
+    
+    sorted_pids = sorted(windows_map.keys())
+    app_logger.info(f"🔍 找到 {len(sorted_pids)} 个微信主窗口实例...")
+    
+    target_tasks = []
+    if target_acc_key == "weixin252121438" or target_acc_key == "1":
+        if len(sorted_pids) >= 1:
+            target_tasks.append((sorted_pids[0], windows_map[sorted_pids[0]], 1, "weixin252121438"))
+    elif target_acc_key == "weixin2" or target_acc_key == "2":
+        if len(sorted_pids) >= 2:
+            target_tasks.append((sorted_pids[1], windows_map[sorted_pids[1]], 2, "weixin2"))
+    else:
+        # 默认自愈所有账号
+        acc_keys = ["weixin252121438", "weixin2"]
+        for idx, pid in enumerate(sorted_pids[:2], start=1):
+            target_tasks.append((pid, windows_map[pid], idx, acc_keys[idx-1] if idx-1 < len(acc_keys) else f"acc_{idx}"))
+            
+    for pid, info, idx, acc_key in target_tasks:
+        current_relogin_target_account = acc_key
+        activate_and_open_miniapp(info['hwnd'], pid, idx, acc_key)
+        
+        app_logger.info(f"⏳ 正在为账号 {idx} [{acc_key}] 监控抓包最新 Token (最多等待 12 秒)...")
+        for _ in range(12):
+            time.sleep(1)
+            accs = load_accounts()
+            cur_tok = accs.get(acc_key, {}).get("token")
+            if test_token_valid(cur_tok):
+                app_logger.info(f"✅ 账号 {idx} [{acc_key}] 成功自愈获取有效 Token！")
+                break
+        time.sleep(1.5)
+        
+    current_relogin_target_account = None
     return True
 
 # ======================= [1. 邮件发送模块 (带多轮重试 & 智能排版)] =======================
@@ -352,107 +412,108 @@ def send_email_report(account_index, nickname, mobile, success, status_desc, pri
 # ======================= [2. 账号数据持久化与多源同步] =======================
 def load_accounts():
     db = {}
-    if os.path.exists(DB_FILE):
-        try:
-            with open(DB_FILE, "r", encoding="utf-8") as f:
-                db = json.load(f)
-        except Exception:
-            db = {}
-            
-    # 从外部兼容 token.json 文件同步读取
-    for acc_key, ext_path in EXTERNAL_TOKEN_FILES.items():
-        if os.path.exists(ext_path):
+    with db_lock:
+        if os.path.exists(DB_FILE):
             try:
-                with open(ext_path, "r", encoding="utf-8") as f:
-                    ext_data = json.load(f)
-                    rt = ext_data.get("refresh_token") or ext_data.get("refreshToken")
-                    tok = ext_data.get("token")
-                    if rt or tok:
-                        if acc_key not in db:
-                            db[acc_key] = {
-                                "mobile": acc_key,
-                                "nickname": acc_key,
-                                "token": tok or "",
-                                "refreshToken": rt or "",
-                                "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
-                            }
-                        else:
-                            if rt:
-                                db[acc_key]["refreshToken"] = rt
-                            if tok and not db[acc_key].get("token"):
-                                db[acc_key]["token"] = tok
+                with open(DB_FILE, "r", encoding="utf-8") as f:
+                    db = json.load(f)
             except Exception:
-                pass
+                db = {}
+                
+        # 兼容外部 token.json 文件
+        for acc_key, ext_path in EXTERNAL_TOKEN_FILES.items():
+            if os.path.exists(ext_path):
+                try:
+                    with open(ext_path, "r", encoding="utf-8") as f:
+                        ext_data = json.load(f)
+                        rt = ext_data.get("refresh_token") or ext_data.get("refreshToken")
+                        tok = ext_data.get("token")
+                        if rt or tok:
+                            if acc_key not in db:
+                                db[acc_key] = {
+                                    "mobile": acc_key,
+                                    "nickname": acc_key,
+                                    "token": tok or "",
+                                    "refreshToken": rt or "",
+                                    "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
+                                }
+                            else:
+                                if rt:
+                                    db[acc_key]["refreshToken"] = rt
+                                if tok and not db[acc_key].get("token"):
+                                    db[acc_key]["token"] = tok
+                except Exception:
+                    pass
 
     return db
 
 def save_account(user_data, acc_key=None):
-    mobile = str(user_data.get("mobile") or user_data.get("ident") or user_data.get("phone") or "unknown")
-    nickname = str(user_data.get("nickname", "用户"))
-    token = user_data.get("token")
-    refresh_token = user_data.get("refreshToken") or user_data.get("refresh_token")
-    daily_completed_date = user_data.get("daily_completed_date")
-    db = load_accounts()
-    
-    key = acc_key or mobile
-    if key not in db and user_data.get("ident"):
-        key = str(user_data.get("ident"))
-        
-    existing = db.get(key, {})
-    db[key] = {
-        "mobile": mobile if mobile != "unknown" else existing.get("mobile", key),
-        "nickname": nickname if nickname != "用户" else existing.get("nickname", key),
-        "ident": user_data.get("ident", "") or existing.get("ident", ""),
-        "token": token or existing.get("token", ""),
-        "refreshToken": refresh_token or existing.get("refreshToken", ""),
-        "daily_completed_date": daily_completed_date or existing.get("daily_completed_date", ""),
-        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
-    }
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(db, f, ensure_ascii=False, indent=2)
-        
-    # 同步回写 external token.json
-    if key in EXTERNAL_TOKEN_FILES:
-        try:
-            ext_path = EXTERNAL_TOKEN_FILES[key]
-            with open(ext_path, "w", encoding="utf-8") as ef:
-                json.dump({
-                    "refresh_token": db[key]["refreshToken"],
-                    "token": db[key]["token"]
-                }, ef, indent=2)
-        except Exception:
-            pass
-            
-    app_logger.info(f"🎉 [数据持久化] 成功保存账号 [{db[key]['nickname']} ({db[key]['mobile']})] 最新 Token 数据！")
+    """保存或更新单个账号信息，并将最新 Token 同步回写 external token.json"""
+    global current_relogin_target_account
+    with db_lock:
+        db = {}
+        if os.path.exists(DB_FILE):
+            try:
+                with open(DB_FILE, "r", encoding="utf-8") as f:
+                    db = json.load(f)
+            except Exception:
+                db = {}
 
-def fetch_user_info_and_save(token):
-    """通过 Token 查询用户信息并保存 (带重试机制)"""
+        target_key = acc_key or current_relogin_target_account or user_data.get("ident") or user_data.get("mobile")
+        
+        # 如果未指定 target_key，优先匹配现有账号列表中 Token 无效的账号
+        if not target_key or target_key not in db:
+            for k, v in db.items():
+                if not test_token_valid(v.get("token")):
+                    target_key = k
+                    break
+                    
+        # 若仍无法匹配，回退到首个账号
+        if not target_key:
+            keys = list(db.keys())
+            target_key = keys[0] if keys else "weixin252121438"
+
+        existing = db.get(target_key, {})
+        new_token = user_data.get("token") or existing.get("token", "")
+        new_refresh = user_data.get("refreshToken") or user_data.get("refresh_token") or existing.get("refreshToken", "")
+        daily_date = user_data.get("daily_completed_date") or existing.get("daily_completed_date", "")
+        
+        db[target_key] = {
+            "mobile": existing.get("mobile", target_key),
+            "nickname": existing.get("nickname", target_key),
+            "ident": existing.get("ident", target_key),
+            "token": new_token,
+            "refreshToken": new_refresh,
+            "daily_completed_date": daily_date,
+            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")
+        }
+        
+        with open(DB_FILE, "w", encoding="utf-8") as f:
+            json.dump(db, f, ensure_ascii=False, indent=2)
+            
+        # 同步回写 external token.json
+        if target_key in EXTERNAL_TOKEN_FILES:
+            try:
+                ext_path = EXTERNAL_TOKEN_FILES[target_key]
+                os.makedirs(os.path.dirname(ext_path), exist_ok=True)
+                with open(ext_path, "w", encoding="utf-8") as ef:
+                    json.dump({
+                        "refresh_token": db[target_key]["refreshToken"],
+                        "token": db[target_key]["token"]
+                    }, ef, indent=2)
+            except Exception:
+                pass
+                
+        app_logger.info(f"🎉 [数据持久化] 成功更新保存账号 [{db[target_key].get('nickname', target_key)} ({target_key})] 最新 Token 数据！")
+
+def handle_intercepted_token(token, refresh_token=None):
+    """处理代理抓包捕获到的 Token 并持久化存储"""
     if not token:
         return
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/x-www-form-urlencoded",
-        "Referer": "https://servicewechat.com/wx44a67f9e199a46d0/221/page-frame.html"
-    }
-    for attempt in range(1, MAX_NETWORK_RETRIES + 1):
-        try:
-            r = http_client.get(f"{BASE_URL}/turntable/paying/info", params={"shopId": SHOP_ID}, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
-            if r.status_code == 200:
-                res = r.json()
-                if res.get("code") in [0, 200]:
-                    data = res.get("data") or {}
-                    nickname = data.get("nickname") or data.get("userName") or "微信用户"
-                    mobile = str(data.get("mobile") or data.get("phone") or data.get("ident") or token[-8:])
-                    save_account({
-                        "mobile": mobile,
-                        "nickname": nickname,
-                        "token": token
-                    })
-                    return
-        except Exception as e:
-            if attempt < MAX_NETWORK_RETRIES:
-                time.sleep(1.5)
+    save_account({
+        "token": token,
+        "refreshToken": refresh_token
+    })
 
 # ======================= [3. 内嵌 Mitmproxy 抓包代理服务] =======================
 from mitmproxy import http, options
@@ -466,7 +527,7 @@ class MiniAppInterceptor:
             if auth.startswith("Bearer "):
                 token = auth.split("Bearer ")[1].strip()
                 if token:
-                    threading.Thread(target=fetch_user_info_and_save, args=(token,), daemon=True).start()
+                    threading.Thread(target=handle_intercepted_token, args=(token,), daemon=True).start()
 
     def response(self, flow: http.HTTPFlow) -> None:
         # 拦截 /wx/mp/login 登录响应
@@ -474,7 +535,10 @@ class MiniAppInterceptor:
             try:
                 res = json.loads(flow.response.text)
                 if res.get("code") == 200 and "data" in res:
-                    save_account(res["data"])
+                    tok = res["data"].get("token")
+                    rt = res["data"].get("refreshToken")
+                    if tok:
+                        threading.Thread(target=handle_intercepted_token, args=(tok, rt), daemon=True).start()
             except Exception as e:
                 app_logger.error(f"解析登录响应失败: {e}")
         # 拦截 token refresh 响应
@@ -482,7 +546,10 @@ class MiniAppInterceptor:
             try:
                 res = json.loads(flow.response.text)
                 if res.get("code") == 200 and "data" in res:
-                    save_account(res["data"])
+                    tok = res["data"].get("token")
+                    rt = res["data"].get("refreshToken")
+                    if tok:
+                        threading.Thread(target=handle_intercepted_token, args=(tok, rt), daemon=True).start()
             except Exception:
                 pass
 
@@ -620,7 +687,6 @@ def run_sign_workflow(round_count):
     today_str = time.strftime("%Y-%m-%d")
     
     # 检查账号数量及有效性
-    need_relogin = False
     for acc_key, info in list(accounts.items()):
         # 如果当天已经签满，无需强制重登
         if info.get("daily_completed_date") == today_str:
@@ -637,20 +703,10 @@ def run_sign_workflow(round_count):
                 save_account(info, acc_key=acc_key)
                 app_logger.info(f"✅ 账号 [{info.get('nickname', acc_key)}] 静默刷新 Token 成功！")
             else:
-                app_logger.warning(f"⚠️ 账号 [{info.get('nickname', acc_key)}] 静默刷新失败，需拉起微信重登！")
-                need_relogin = True
+                app_logger.warning(f"⚠️ 账号 [{info.get('nickname', acc_key)}] 静默刷新失败，正在触发窗口自愈重登...")
+                trigger_dual_wechat_relogin(acc_key)
 
-    if len(accounts) < 2:
-        need_relogin = True
-
-    # 触发自愈重登
-    if need_relogin:
-        trigger_dual_wechat_relogin()
-        app_logger.info("⏳ 等待 15 秒供小程序加载并抓取最新 Token...")
-        for _ in range(15):
-            time.sleep(1)
-        accounts = load_accounts()
-
+    accounts = load_accounts()
     if not accounts:
         app_logger.error("❌ 未能获取到任何有效账号，本次签到跳过。")
         return
@@ -676,8 +732,7 @@ def run_sign_workflow(round_count):
         # 如果抽奖返回“请登录后再操作”，触发就地自愈再重试一次
         if result.get("code") in [401, 403] or "登录" in str(result.get("msg", "")):
             app_logger.warning(f"⚠️ 账号 {idx} [{nickname}] 抽奖反馈需重新登录，立即触发窗口自愈重试...")
-            trigger_dual_wechat_relogin()
-            time.sleep(12)
+            trigger_dual_wechat_relogin(acc_key)
             fresh_accs = load_accounts()
             if fresh_accs.get(acc_key, {}).get("token"):
                 token = fresh_accs[acc_key]["token"]
