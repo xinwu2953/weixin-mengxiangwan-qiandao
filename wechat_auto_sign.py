@@ -214,14 +214,17 @@ def click_screen(x, y):
     time.sleep(0.1)
 
 def activate_and_open_miniapp(hwnd, pid, index, acc_key=""):
-    """激活指定微信主窗口并通过原生界面搜索打开小程序 (无任何Windows协议弹窗)"""
+    """激活指定微信主窗口并通过原生界面搜索或前置窗口唤醒打开小程序"""
     try:
         cur_thread = kernel32.GetCurrentThreadId()
         target_thread = user32.GetWindowThreadProcessId(hwnd, None)
         if cur_thread != target_thread and target_thread != 0:
             user32.AttachThreadInput(cur_thread, target_thread, True)
         
+        # 统一恢复并固定窗口位置，避免坐标错位
         user32.ShowWindow(hwnd, 9) # SW_RESTORE
+        user32.ShowWindow(hwnd, 5) # SW_SHOW
+        user32.SetWindowPos(hwnd, -1, 100, 100, 1000, 700, 0x0040) # HWND_TOP + SWP_SHOWWINDOW
         user32.SetForegroundWindow(hwnd)
         user32.BringWindowToTop(hwnd)
         
@@ -229,15 +232,13 @@ def activate_and_open_miniapp(hwnd, pid, index, acc_key=""):
             user32.AttachThreadInput(cur_thread, target_thread, False)
         
         time.sleep(1.0)
-        r = ctypes.wintypes.RECT()
-        user32.GetWindowRect(hwnd, ctypes.byref(r))
+        app_logger.info(f"📱 正在为第 {index} 个微信 [{acc_key}] (HWND: {hwnd}, PID: {pid}) 定位并拉起'梦享玩'小程序...")
         
-        app_logger.info(f"📱 正在为第 {index} 个微信 [{acc_key}] (HWND: {hwnd}, PID: {pid}) 搜索拉起'梦享玩'小程序...")
-        # 点击搜索框
-        click_screen(r.left + 200, r.top + 35)
-        time.sleep(0.5)
+        # 1. 模拟点击顶部搜索框 (在 1000x700 窗口规范化坐标系中，搜索框位于 250, 135)
+        click_screen(250, 135)
+        time.sleep(0.4)
         
-        # 全选并清空可能残留的旧搜索词
+        # 2. 全选并清空可能残留的旧搜索词
         user32.keybd_event(0x11, 0, 0, 0) # Ctrl
         user32.keybd_event(0x41, 0, 0, 0) # A
         time.sleep(0.05)
@@ -249,24 +250,28 @@ def activate_and_open_miniapp(hwnd, pid, index, acc_key=""):
         user32.keybd_event(0x2E, 0, 2, 0)
         time.sleep(0.2)
         
-        # 粘贴“梦享玩”
+        # 3. 剪贴板输入“梦享玩”
         pyperclip.copy("梦享玩")
         user32.keybd_event(0x11, 0, 0, 0) # Ctrl
         user32.keybd_event(0x56, 0, 0, 0) # V
         time.sleep(0.08)
         user32.keybd_event(0x56, 0, 2, 0)
         user32.keybd_event(0x11, 0, 2, 0)
-        time.sleep(1.2) # 等待微信搜索下拉面板渲染出小程序项
+        time.sleep(1.5) # 等待微信搜索下拉面板渲染
         
-        # 点击下拉项首个结果 (小程序图标行)
-        click_screen(r.left + 200, r.top + 100)
-        time.sleep(1.0)
-        
-        # 兜底：回车确认
+        # 4. 下方向键选中第 1 个搜索联想项（小程序直达），并回车确认打开
+        user32.keybd_event(0x28, 0, 0, 0) # VK_DOWN
+        time.sleep(0.08)
+        user32.keybd_event(0x28, 0, 2, 0)
+        time.sleep(0.3)
         user32.keybd_event(0x0D, 0, 0, 0) # Enter
         time.sleep(0.08)
         user32.keybd_event(0x0D, 0, 2, 0)
-        time.sleep(2.0)
+        time.sleep(1.5)
+        
+        # 5. 兜底辅助点击：防止个别主题下未聚焦下拉框
+        click_screen(250, 200)
+        time.sleep(1.0)
     except Exception as e:
         app_logger.error(f"激活微信窗口失败: {e}")
 
@@ -281,11 +286,6 @@ def trigger_dual_wechat_relogin(target_acc_key=None):
         app_logger.error("❌ 未检测到运行中的微信主窗口，请确保微信多开正常挂在后台！")
         return False
         
-    # 先清理旧的 WeChatAppEx.exe 进程，确保小程序强制冷启动发送登录与Token请求
-    app_logger.info("🧹 正在重置小程序后台运行态以确保冷启动抓取最新 Token...")
-    subprocess.run("taskkill /F /IM WeChatAppEx.exe", shell=True, capture_output=True)
-    time.sleep(1.5)
-    
     sorted_pids = sorted(windows_map.keys())
     app_logger.info(f"🔍 找到 {len(sorted_pids)} 个微信主窗口实例...")
     
@@ -304,6 +304,33 @@ def trigger_dual_wechat_relogin(target_acc_key=None):
             
     for pid, info, idx, acc_key in target_tasks:
         current_relogin_target_account = acc_key
+        
+        # 先尝试唤醒已存在的小程序窗口并刷新
+        app_logger.info(f"🔄 [通道1] 检查账号 {idx} [{acc_key}] 的小程序后台窗口并尝试就地刷新...")
+        refreshed = False
+        for p in psutil.process_iter(['pid', 'name']):
+            if 'wechatappex' in (p.info['name'] or '').lower():
+                try:
+                    for t in p.threads():
+                        def appex_enum(h, lp):
+                            nonlocal refreshed
+                            buf = ctypes.create_unicode_buffer(256)
+                            user32.GetClassNameW(h, buf, 256)
+                            if buf.value == 'Chrome_WidgetWin_0':
+                                user32.ShowWindow(h, 9) # SW_RESTORE
+                                user32.ShowWindow(h, 5) # SW_SHOW
+                                user32.SetForegroundWindow(h)
+                                user32.BringWindowToTop(h)
+                                user32.PostMessageW(h, 0x0100, 0x74, 0) # WM_KEYDOWN VK_F5
+                                time.sleep(0.05)
+                                user32.PostMessageW(h, 0x0101, 0x74, 0) # WM_KEYUP VK_F5
+                                refreshed = True
+                            return True
+                        user32.EnumThreadWindows(t.id, ctypes.WINFUNCTYPE(ctypes.wintypes.BOOL, ctypes.wintypes.HWND, ctypes.wintypes.LPARAM)(appex_enum), 0)
+                except Exception:
+                    pass
+                    
+        # 通道2：通过主微信窗口搜索唤醒
         activate_and_open_miniapp(info['hwnd'], pid, idx, acc_key)
         
         app_logger.info(f"⏳ 正在为账号 {idx} [{acc_key}] 监控抓包最新 Token (最多等待 12 秒)...")
