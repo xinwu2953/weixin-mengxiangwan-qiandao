@@ -214,8 +214,9 @@ def click_screen(x, y):
     time.sleep(0.1)
 
 def activate_and_open_miniapp(hwnd, pid, index, acc_key=""):
-    """激活指定微信主窗口并通过原生界面搜索或前置窗口唤醒打开小程序"""
+    """激活指定微信主窗口并通过原生搜索唤醒打开小程序"""
     try:
+        set_system_proxy(False)
         cur_thread = kernel32.GetCurrentThreadId()
         target_thread = user32.GetWindowThreadProcessId(hwnd, None)
         if cur_thread != target_thread and target_thread != 0:
@@ -231,11 +232,21 @@ def activate_and_open_miniapp(hwnd, pid, index, acc_key=""):
         if cur_thread != target_thread and target_thread != 0:
             user32.AttachThreadInput(cur_thread, target_thread, False)
         
-        time.sleep(1.0)
+        time.sleep(0.6)
         app_logger.info(f"📱 正在为第 {index} 个微信 [{acc_key}] (HWND: {hwnd}, PID: {pid}) 定位并拉起'梦享玩'小程序...")
         
-        # 1. 模拟点击顶部搜索框 (在 1000x700 窗口规范化坐标系中，搜索框位于 250, 135)
-        click_screen(250, 135)
+        # 先按 Esc 关闭任何已存在的遮罩或弹窗
+        user32.keybd_event(0x1B, 0, 0, 0)
+        time.sleep(0.05)
+        user32.keybd_event(0x1B, 0, 2, 0)
+        time.sleep(0.2)
+        
+        # 1. 快捷键 Ctrl + F 聚焦全局搜索框
+        user32.keybd_event(0x11, 0, 0, 0) # Ctrl
+        user32.keybd_event(0x46, 0, 0, 0) # F
+        time.sleep(0.05)
+        user32.keybd_event(0x46, 0, 2, 0)
+        user32.keybd_event(0x11, 0, 2, 0)
         time.sleep(0.4)
         
         # 2. 全选并清空可能残留的旧搜索词
@@ -257,41 +268,15 @@ def activate_and_open_miniapp(hwnd, pid, index, acc_key=""):
         time.sleep(0.08)
         user32.keybd_event(0x56, 0, 2, 0)
         user32.keybd_event(0x11, 0, 2, 0)
-        time.sleep(1.5) # 等待微信搜索下拉面板渲染
+        time.sleep(1.2) # 等待微信搜索下拉面板渲染
         
-        # 4. 下方向键选中第 1 个搜索联想项（小程序直达），并回车确认打开
-        user32.keybd_event(0x28, 0, 0, 0) # VK_DOWN
-        time.sleep(0.08)
-        user32.keybd_event(0x28, 0, 2, 0)
-        time.sleep(0.3)
+        # 4. 回车确认打开小程序直达项
         user32.keybd_event(0x0D, 0, 0, 0) # Enter
         time.sleep(0.08)
         user32.keybd_event(0x0D, 0, 2, 0)
-        time.sleep(1.5)
-        
-        # 5. 兜底辅助点击：防止个别主题下未聚焦下拉框
-        click_screen(250, 200)
-        time.sleep(1.0)
+        time.sleep(2.0)
     except Exception as e:
         app_logger.error(f"激活微信窗口失败: {e}")
-
-def clear_applet_local_storage(acc_idx):
-    """清理对应微信账号的小程序本地缓存，确保冷启动强制重新向服务端申请有效认证"""
-    user_hashes = [
-        "25f8fed23027fedab032d1210dba1c1a", # 账号 1 (weixin252121438 / wxid_4mbyafbboci822)
-        "bd658851ea3dee19ebe55b06e1401262"  # 账号 2 (weixin2 / xinwu2953)
-    ]
-    if 1 <= acc_idx <= len(user_hashes):
-        uhash = user_hashes[acc_idx - 1]
-        base_dir = fr"C:\Users\wangxw\AppData\Roaming\Tencent\xwechat\radium\Applet\{uhash}\local\wx44a67f9e199a46d0"
-        for sub in ["usrmmkvstorage0", "usrmmkvstorage1", "temp"]:
-            target_p = os.path.join(base_dir, sub)
-            if os.path.exists(target_p):
-                try:
-                    shutil.rmtree(target_p)
-                    app_logger.info(f"🧹 已重置账号 {acc_idx} 本地小程序存储缓存: {sub}")
-                except Exception as e:
-                    app_logger.warning(f"⚠️ 清理本地存储缓存异常: {e}")
 
 def trigger_dual_wechat_relogin(target_acc_key=None):
     """
@@ -299,6 +284,7 @@ def trigger_dual_wechat_relogin(target_acc_key=None):
     支持指定单个账号自愈（如 'weixin252121438' 或 'weixin2'），或全部自愈
     """
     global current_relogin_target_account
+    set_system_proxy(False)
     windows_map = get_main_wechat_windows()
     if not windows_map:
         app_logger.error("❌ 未检测到运行中的微信主窗口，请确保微信多开正常挂在后台！")
@@ -320,21 +306,17 @@ def trigger_dual_wechat_relogin(target_acc_key=None):
         for idx, pid in enumerate(sorted_pids[:2], start=1):
             target_tasks.append((pid, windows_map[pid], idx, acc_keys[idx-1] if idx-1 < len(acc_keys) else f"acc_{idx}"))
             
-    # 先清理旧的 WeChatAppEx 进程，重置网络运行环境
-    subprocess.run("taskkill /F /IM WeChatAppEx.exe", shell=True, capture_output=True)
-    time.sleep(1.0)
-    
     for pid, info, idx, acc_key in target_tasks:
         current_relogin_target_account = acc_key
         
-        # 1. 深度清理本地可能残留的过期 Token 缓存，避免小程序重复发送旧凭证
-        clear_applet_local_storage(idx)
+        # 1. 确保网络代理禁用，避免小程序白屏
+        set_system_proxy(False)
                     
         # 2. 通过主微信窗口定位并拉起小程序
         activate_and_open_miniapp(info['hwnd'], pid, idx, acc_key)
         
-        app_logger.info(f"⏳ 正在为账号 {idx} [{acc_key}] 监控抓包最新 Token (最多等待 12 秒)...")
-        for _ in range(12):
+        app_logger.info(f"⏳ 正在为账号 {idx} [{acc_key}] 监控最新 Token (最多等待 15 秒)...")
+        for _ in range(15):
             time.sleep(1)
             accs = load_accounts()
             cur_tok = accs.get(acc_key, {}).get("token")
@@ -797,6 +779,10 @@ def main():
     print("=" * 65)
     print("   微信小程序双开全自动自愈签到助手 (每5小时循环 + QQ邮箱独立通知)   ")
     print("=" * 65)
+    
+    # 确保网络环境干净，绝不残留代理导致小程序白屏
+    set_system_proxy(False)
+    atexit.register(lambda: set_system_proxy(False))
     
     # 1. 启动内嵌抓包代理
     proxy_thread = threading.Thread(target=start_embedded_proxy, daemon=True)
