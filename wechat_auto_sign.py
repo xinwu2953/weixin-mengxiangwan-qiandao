@@ -266,48 +266,66 @@ def activate_and_open_miniapp(hwnd, pid, index, acc_key=""):
             user32.AttachThreadInput(cur_thread, target_thread, False)
         
         time.sleep(0.6)
-        app_logger.info(f"📱 正在为第 {index} 个微信 [{acc_key}] (HWND: {hwnd}, PID: {pid}) 定位并拉起'梦享玩'小程序...")
+        app_logger.info(f"📱 正在为第 {index} 个微信 [{acc_key}] (HWND: {hwnd}, PID: {pid}) 从左侧小程序面板打开'梦享玩'...")
         
-        # 先按 Esc 关闭任何已存在的遮罩或弹窗
-        user32.keybd_event(0x1B, 0, 0, 0)
-        time.sleep(0.05)
-        user32.keybd_event(0x1B, 0, 2, 0)
-        time.sleep(0.2)
+        # 1. 窗口位置标准化 (100, 100, 1000, 750)
+        user32.SetWindowPos(hwnd, -1, 100, 100, 1000, 750, 0x0040)
+        time.sleep(0.3)
         
-        # 1. 快捷键 Ctrl + F 聚焦全局搜索框
-        user32.keybd_event(0x11, 0, 0, 0) # Ctrl
-        user32.keybd_event(0x46, 0, 0, 0) # F
-        time.sleep(0.05)
-        user32.keybd_event(0x46, 0, 2, 0)
-        user32.keybd_event(0x11, 0, 2, 0)
-        time.sleep(0.4)
-        
-        # 2. 全选并清空可能残留的旧搜索词
-        user32.keybd_event(0x11, 0, 0, 0) # Ctrl
-        user32.keybd_event(0x41, 0, 0, 0) # A
-        time.sleep(0.05)
-        user32.keybd_event(0x41, 0, 2, 0)
-        user32.keybd_event(0x11, 0, 2, 0)
+        # 2. 点击左侧边栏“小程序”面板图标 (坐标 x=100+28=128, y=100+335=435)
+        user32.SetCursorPos(128, 435)
         time.sleep(0.1)
-        user32.keybd_event(0x2E, 0, 0, 0) # Del
-        time.sleep(0.05)
-        user32.keybd_event(0x2E, 0, 2, 0)
-        time.sleep(0.2)
-        
-        # 3. 剪贴板输入“梦享玩”
-        pyperclip.copy("梦享玩")
-        user32.keybd_event(0x11, 0, 0, 0) # Ctrl
-        user32.keybd_event(0x56, 0, 0, 0) # V
+        user32.mouse_event(0x0002, 0, 0, 0, 0)
         time.sleep(0.08)
-        user32.keybd_event(0x56, 0, 2, 0)
-        user32.keybd_event(0x11, 0, 2, 0)
-        time.sleep(1.2) # 等待微信搜索下拉面板渲染
+        user32.mouse_event(0x0004, 0, 0, 0, 0)
+        time.sleep(1.2)
         
-        # 4. 回车确认打开小程序直达项
-        user32.keybd_event(0x0D, 0, 0, 0) # Enter
-        time.sleep(0.08)
-        user32.keybd_event(0x0D, 0, 2, 0)
-        time.sleep(3.5)
+        # 3. 查找弹出的小程序面板窗口 (Chrome_WidgetWin_0)
+        panel_rect = None
+        def find_panel_cb(hw, lp):
+            nonlocal panel_rect
+            if user32.IsWindowVisible(hw):
+                buf_c = ctypes.create_unicode_buffer(256)
+                user32.GetClassNameW(hw, buf_c, 256)
+                if buf_c.value == 'Chrome_WidgetWin_0':
+                    r = wintypes.RECT()
+                    user32.GetWindowRect(hw, ctypes.byref(r))
+                    if (r.right - r.left) > 500 and (r.bottom - r.top) > 400:
+                        panel_rect = r
+            return True
+            
+        user32.EnumDesktopWindows(h_desk, ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)(find_panel_cb), 0)
+        
+        if panel_rect:
+            # 4. 点击小程序面板中的搜索框并输入“梦享玩”
+            user32.SetCursorPos(panel_rect.left + 250, panel_rect.top + 45)
+            time.sleep(0.1)
+            user32.mouse_event(0x0002, 0, 0, 0, 0)
+            time.sleep(0.08)
+            user32.mouse_event(0x0004, 0, 0, 0, 0)
+            time.sleep(0.4)
+            
+            pyperclip.copy("梦享玩")
+            user32.keybd_event(0x11, 0, 0, 0) # Ctrl
+            user32.keybd_event(0x56, 0, 0, 0) # V
+            time.sleep(0.05)
+            user32.keybd_event(0x56, 0, 2, 0)
+            user32.keybd_event(0x11, 0, 2, 0)
+            time.sleep(1.0)
+            
+            # 回车确认搜索
+            user32.keybd_event(0x0D, 0, 0, 0)
+            time.sleep(0.08)
+            user32.keybd_event(0x0D, 0, 2, 0)
+            time.sleep(1.2)
+            
+            # 点击搜索结果列表第一项
+            user32.SetCursorPos(panel_rect.left + 200, panel_rect.top + 160)
+            time.sleep(0.1)
+            user32.mouse_event(0x0002, 0, 0, 0, 0)
+            time.sleep(0.08)
+            user32.mouse_event(0x0004, 0, 0, 0, 0)
+            time.sleep(3.0)
         
         # 5. 定位并前置小程序窗口，执行界面授权触控
         applets = find_applet_window()
