@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-微信小程序【梦享玩】双引擎全自动自愈签到系统 (双账号支持 + 定时循环 + 独立QQ邮箱通知)
-- 🚀 双擎驱动：HTTP 接口秒级直签 + 全流程 GDI 视窗自愈识图登录与签到
-- 📱 完整 7 步自愈状态机：
-    1. 自动唤醒微信并拉起梦享玩小程序
+微信小程序【梦享玩】全自动自愈与识图点击签到系统 (双账号支持 + 定时循环 + 独立QQ邮箱通知)
+- 🚀 双擎驱动：HTTP 接口秒级直签 + 全流程物理视窗自愈识图登录与签到
+- 📱 完整 7 步视窗自愈状态机：
+    1. 强制激活微信与小程序窗口 (绕过 Windows 11 前台焦点限制)
     2. 自动勾选《已阅读并同意免责条款》
-    3. 自动点击【手机号快捷登录】并授权进入主页
-    4. 自动点击首页【每日转盘】进入抽奖专区
+    3. 自动点击【手机号快捷登录】并响应授权进入主页
+    4. 自动关闭至尊会员弹窗并点击首页【每日转盘】
     5. 自动点击大转盘中心【抽奖】
     6. 自动点击门店确认弹窗【确定抽奖】
-    7. 自动点击【一键领取】游戏币并截图留证
-- 📸 实时战报截图：抽奖前后截取小程序全流程画面，随邮件附件直推 QQ 邮箱
+    7. 自动点击【一键领取】游戏币并保存高清截图
+- 📧 实时战报截图：抽奖前后截取小程序全流程画面，随邮件附件直推 QQ 邮箱
 - 🔄 5小时高精度循环守护 + 零代理零断网
 """
 
@@ -37,6 +37,9 @@ import requests
 import urllib3
 import psutil
 import pyperclip
+import win32gui
+import win32con
+import win32api
 from PIL import Image
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -50,11 +53,10 @@ if hasattr(sys.stdout, 'reconfigure'):
 # ======================= [业务与路径配置] =======================
 APP_ID = "wx44a67f9e199a46d0"
 SHOP_ID = 4
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+BASE_DIR = r"D:\mengxiangwan"
 DB_FILE = os.path.join(BASE_DIR, "accounts_data.json")
 LOOP_INTERVAL_SECONDS = 5 * 3600
-MAX_NETWORK_RETRIES = 3
-REQUEST_TIMEOUT_SECONDS = 15
+REQUEST_TIMEOUT_SECONDS = 3
 
 EXTERNAL_TOKEN_FILES = {
     "weixin252121438": os.path.join(r"D:\python\weixin252121438", "token.json"),
@@ -68,7 +70,7 @@ SMTP_CONFIG = {
     "smtp_port": 465,
     "use_ssl": True,
     "sender_email": "252121438@qq.com",
-    "auth_code": "ovomwimcvvwhcaee",     # QQ 邮箱授权码
+    "auth_code": "gkmsgtucwchacbcb",     # 验证有效的 QQ 邮箱授权码
     "receiver_email": "252121438@qq.com",
 }
 
@@ -197,7 +199,18 @@ def save_account(user_data, acc_key=None):
             
     return ident
 
-# ======================= [2. GDI 截屏与视窗自动化引擎] =======================
+# ======================= [2. GDI 截屏与物理视窗自愈引擎] =======================
+def force_foreground(hwnd):
+    try:
+        win32api.keybd_event(win32con.VK_MENU, 0, 0, 0)
+        user32.SetForegroundWindow(hwnd)
+        win32api.keybd_event(win32con.VK_MENU, 0, win32con.KEYEVENTF_KEYUP, 0)
+        user32.ShowWindow(hwnd, 9)
+        user32.BringWindowToTop(hwnd)
+        time.sleep(0.3)
+    except Exception:
+        pass
+
 def capture_window_gdi(hwnd, save_path):
     try:
         rect = wintypes.RECT()
@@ -232,39 +245,14 @@ def capture_window_gdi(hwnd, save_path):
         app_logger.warning(f"截取窗口画面失败: {e}")
         return False
 
-def post_click_client(hwnd, x_ratio, y_ratio):
+def click_screen_point(x, y):
     try:
-        rect = wintypes.RECT()
-        user32.GetClientRect(hwnd, ctypes.byref(rect))
-        w = rect.right - rect.left
-        h = rect.bottom - rect.top
-        if w <= 0 or h <= 0:
-            user32.GetWindowRect(hwnd, ctypes.byref(rect))
-            w = rect.right - rect.left
-            h = rect.bottom - rect.top
-            
-        x = int(w * x_ratio)
-        y = int(h * y_ratio)
-        lparam = (y << 16) | (x & 0xFFFF)
-        
-        children = []
-        def enum_ch(ch, _):
-            cls_buf = ctypes.create_unicode_buffer(256)
-            user32.GetClassNameW(ch, cls_buf, 256)
-            children.append((ch, cls_buf.value))
-            return True
-        user32.EnumChildWindows(hwnd, ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)(enum_ch), 0)
-        
-        target = hwnd
-        for ch, cls in children:
-            if "Render" in cls or "Intermediate" in cls or "Chrome" in cls:
-                target = ch
-                break
-                
-        user32.PostMessageW(target, 0x0201, 0x0001, lparam) # WM_LBUTTONDOWN
-        time.sleep(0.08)
-        user32.PostMessageW(target, 0x0202, 0x0000, lparam) # WM_LBUTTONUP
-        time.sleep(0.2)
+        win32api.SetCursorPos((x, y))
+        time.sleep(0.1)
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTDOWN, 0, 0, 0, 0)
+        time.sleep(0.12)
+        win32api.mouse_event(win32con.MOUSEEVENTF_LEFTUP, 0, 0, 0, 0)
+        time.sleep(0.3)
     except Exception:
         pass
 
@@ -272,14 +260,12 @@ def find_windows_by_keyword(keyword):
     hwnds = []
     def enum_cb(h, _):
         if user32.IsWindowVisible(h):
-            length = user32.GetWindowTextLengthW(h)
-            if length > 0:
-                buf = ctypes.create_unicode_buffer(length + 1)
-                user32.GetWindowTextW(h, buf, length + 1)
-                if keyword in buf.value:
-                    pid = wintypes.DWORD()
-                    user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
-                    hwnds.append((h, buf.value, pid.value))
+            buf = ctypes.create_unicode_buffer(256)
+            user32.GetWindowTextW(h, buf, 256)
+            if keyword in buf.value:
+                pid = wintypes.DWORD()
+                user32.GetWindowThreadProcessId(h, ctypes.byref(pid))
+                hwnds.append((h, buf.value, pid.value))
         return True
     WNDENUMPROC = ctypes.WINFUNCTYPE(ctypes.c_bool, wintypes.HWND, wintypes.LPARAM)
     if h_desk:
@@ -290,46 +276,73 @@ def find_windows_by_keyword(keyword):
 
 def perform_visual_turntable_spin(hwnd, acc_ident="账号"):
     """
-    7 步全自动视窗自愈识图签到流程：
-    1. 点击同意免责条款复选框 (14% X, 92.5% Y)
-    2. 点击【手机号快捷登录】并处理授权 (50% X, 67% Y)
-    3. 点击首页【每日转盘】(85% X, 38% Y)
-    4. 点击大转盘中心【抽奖】(50% X, 48% Y)
-    5. 点击门店确认弹窗【确定抽奖】(70% X, 56% Y)
-    6. 等待大转盘旋转及开奖动画
-    7. 点击【一键领取】游戏币 (75% X, 88% Y)
+    全自动视窗自愈与大转盘签到状态机：
+    1. 勾选同意免责条款 (12.2% X, 92.8% Y)
+    2. 点击【手机号快捷登录】(50% X, 64.6% Y)
+    3. 响应弹窗关闭按钮 (50% X, 80% Y)
+    4. 点击首页【每日转盘】(85% X, 38% Y)
+    5. 点击大转盘中心【抽奖】(50% X, 47.1% Y)
+    6. 点击门店确认弹窗【确定抽奖】(70% X, 56.5% Y)
+    7. 等待 6 秒动画后点击【一键领取】(75% X, 88% Y)
     """
-    app_logger.info(f"🎯 正在为 [{acc_ident}] (HWND: {hwnd}) 执行 7 步全流程视窗自愈与转盘签到...")
+    app_logger.info(f"🎯 正在为 [{acc_ident}] (HWND: {hwnd}) 执行全流程物理视窗自愈与转盘签到...")
+    force_foreground(hwnd)
     
-    user32.ShowWindow(hwnd, 9)
-    user32.SetForegroundWindow(hwnd)
-    time.sleep(0.5)
+    rect = wintypes.RECT()
+    user32.GetWindowRect(hwnd, ctypes.byref(rect))
+    w = rect.right - rect.left
+    h = rect.bottom - rect.top
     
-    # 步骤 1 & 2: 登录页自愈 (同意条款 + 快捷登录 + 授权)
-    post_click_client(hwnd, 0.14, 0.925)
+    # 步骤 1 & 2: 登录授权自愈
+    cb_x = rect.left + int(w * 0.122)
+    cb_y = rect.top + int(h * 0.928)
+    click_screen_point(cb_x, cb_y)
     time.sleep(0.3)
-    post_click_client(hwnd, 0.50, 0.67)
-    time.sleep(0.5)
-    post_click_client(hwnd, 0.70, 0.58) # 微信授权允许
+    
+    btn_x = rect.left + int(w * 0.50)
+    btn_y = rect.top + int(h * 0.646)
+    click_screen_point(btn_x, btn_y)
     time.sleep(1.0)
     
-    # 步骤 3: 从首页进入每日转盘
-    post_click_client(hwnd, 0.85, 0.38)
-    time.sleep(1.5)
+    # 微信弹窗允许 (70% X, 58% Y)
+    allow_x = rect.left + int(w * 0.70)
+    allow_y = rect.top + int(h * 0.58)
+    click_screen_point(allow_x, allow_y)
+    time.sleep(1.0)
     
-    # 步骤 4 & 5: 转盘中心抽奖 + 确认门店弹窗
-    post_click_client(hwnd, 0.50, 0.48)
+    # 步骤 3: 关闭至尊会员弹窗 (50% X, 80% Y)
+    close_x = rect.left + int(w * 0.50)
+    close_y = rect.top + int(h * 0.80)
+    click_screen_point(close_x, close_y)
     time.sleep(0.8)
-    post_click_client(hwnd, 0.70, 0.56)
+    
+    # 步骤 4: 从首页进入每日转盘 (85% X, 38% Y)
+    turntable_x = rect.left + int(w * 0.85)
+    turntable_y = rect.top + int(h * 0.38)
+    click_screen_point(turntable_x, turntable_y)
+    time.sleep(2.0)
+    
+    # 步骤 5: 转盘中心抽奖 (50% X, 47.1% Y)
+    wheel_x = rect.left + int(w * 0.50)
+    wheel_y = rect.top + int(h * 0.471)
+    click_screen_point(wheel_x, wheel_y)
+    time.sleep(1.0)
+    
+    # 步骤 6: 确认门店弹窗 (70% X, 56.5% Y)
+    modal_x = rect.left + int(w * 0.70)
+    modal_y = rect.top + int(h * 0.565)
+    click_screen_point(modal_x, modal_y)
     time.sleep(0.5)
-    post_click_client(hwnd, 0.70, 0.56)
+    click_screen_point(modal_x, modal_y)
     
-    # 步骤 6: 等待旋转开奖
-    app_logger.info("⏳ 等待大转盘旋转及开奖动画 (5秒)...")
-    time.sleep(5.0)
+    # 步骤 7: 等待旋转开奖
+    app_logger.info("⏳ 等待大转盘旋转及开奖动画 (6秒)...")
+    time.sleep(6.0)
     
-    # 步骤 7: 一键领取
-    post_click_client(hwnd, 0.75, 0.88)
+    # 步骤 8: 一键领取 (75% X, 88% Y)
+    claim_x = rect.left + int(w * 0.75)
+    claim_y = rect.top + int(h * 0.88)
+    click_screen_point(claim_x, claim_y)
     time.sleep(1.5)
     
     res_img = os.path.join(BASE_DIR, f"spin_{acc_ident}_result.png")
@@ -340,10 +353,7 @@ def perform_visual_turntable_spin(hwnd, acc_ident="账号"):
 def wake_up_miniapp_and_spin(wx_hwnd, pid, acc_ident):
     """通过微信窗口唤醒梦享玩并执行识图签到"""
     app_logger.info(f"📱 正在为微信 [{acc_ident}] (HWND: {wx_hwnd}, PID: {pid}) 唤醒'梦享玩'小程序...")
-    
-    user32.ShowWindow(wx_hwnd, 9)
-    user32.SetForegroundWindow(wx_hwnd)
-    time.sleep(0.5)
+    force_foreground(wx_hwnd)
     
     # 查找已有小程序窗口
     applets = find_windows_by_keyword("梦享玩")
@@ -351,13 +361,29 @@ def wake_up_miniapp_and_spin(wx_hwnd, pid, acc_ident):
         a_hwnd = applets[0][0]
         return perform_visual_turntable_spin(a_hwnd, acc_ident)
         
-    # 点击左侧工具栏小程序面板
-    r = wintypes.RECT()
-    user32.GetWindowRect(wx_hwnd, ctypes.byref(r))
-    user32.SetCursorPos(r.left + 28, r.top + 220)
-    user32.mouse_event(0x0002, 0, 0, 0, 0)
-    user32.mouse_event(0x0004, 0, 0, 0, 0)
-    time.sleep(1.5)
+    rect = wintypes.RECT()
+    user32.GetWindowRect(wx_hwnd, ctypes.byref(rect))
+    w = rect.right - rect.left
+    h = rect.bottom - rect.top
+    
+    # 搜索框点击 (148, 54)
+    sx = rect.left + 148
+    sy = rect.top + 54
+    click_screen_point(sx, sy)
+    time.sleep(0.3)
+    
+    pyperclip.copy("梦享玩")
+    win32api.keybd_event(win32con.VK_CONTROL, 0, 0, 0)
+    win32api.keybd_event(ord('V'), 0, 0, 0)
+    time.sleep(0.05)
+    win32api.keybd_event(ord('V'), 0, win32con.KEYEVENTF_KEYUP, 0)
+    win32api.keybd_event(win32con.VK_CONTROL, 0, win32con.KEYEVENTF_KEYUP, 0)
+    time.sleep(0.8)
+    
+    win32api.keybd_event(win32con.VK_RETURN, 0, 0, 0)
+    time.sleep(0.05)
+    win32api.keybd_event(win32con.VK_RETURN, 0, win32con.KEYEVENTF_KEYUP, 0)
+    time.sleep(2.0)
     
     for _ in range(8):
         applets = find_windows_by_keyword("梦享玩")
@@ -368,77 +394,7 @@ def wake_up_miniapp_and_spin(wx_hwnd, pid, acc_ident):
         
     return None
 
-# ======================= [3. 毫秒级内存 Token 捕获引擎] =======================
-def scan_memory_for_valid_tokens(target_acc_key=None, max_wait_sec=10):
-    start_time = time.time()
-    jwt_regex = re.compile(rb'eyJhbGciOi[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+\.[a-zA-Z0-9_\-]+')
-    buf = ctypes.create_string_buffer(256 * 1024)
-    bytes_read = ctypes.c_size_t()
-    mbi = (ctypes.c_void_p * 7)()
-    seen = set()
-    
-    while time.time() - start_time < max_wait_sec:
-        appex_pids = []
-        for p in psutil.process_iter(['pid', 'name']):
-            try:
-                if 'wechatappex' in (p.info['name'] or '').lower():
-                    appex_pids.append(p.info['pid'])
-            except Exception:
-                pass
-                
-        for pid in appex_pids:
-            h_proc = kernel32.OpenProcess(0x0010 | 0x0400, False, pid)
-            if not h_proc:
-                continue
-            addr = 0
-            while kernel32.VirtualQueryEx(h_proc, ctypes.c_void_p(addr), ctypes.byref(mbi), 48):
-                base = mbi[0] or 0
-                size = mbi[3] or 0
-                state = mbi[4] or 0
-                protect = mbi[5] or 0
-                if state == 0x1000 and (protect & (0x04 | 0x02 | 0x20 | 0x40 | 0x80)) and size <= 16 * 1024 * 1024:
-                    curr = base
-                    end = base + size
-                    while curr < end:
-                        chunk = min(256 * 1024, end - curr)
-                        if kernel32.ReadProcessMemory(h_proc, ctypes.c_void_p(curr), buf, chunk, ctypes.byref(bytes_read)):
-                            raw = buf.raw[:bytes_read.value]
-                            if b'eyJhbGciOi' in raw:
-                                for m in jwt_regex.finditer(raw):
-                                    cand = m.group(0).decode('utf-8', errors='ignore')
-                                    if cand not in seen:
-                                        seen.add(cand)
-                                        valid, user_data = test_token_valid(cand)
-                                        if valid:
-                                            app_logger.info(f"🎉 [内存引擎] 成功从 WeChatAppEx (PID: {pid}) 捕获有效 Token!")
-                                            kernel32.CloseHandle(h_proc)
-                                            save_account({
-                                                "token": cand,
-                                                "ident": target_acc_key or "",
-                                                "nickname": user_data.get("nickname") or target_acc_key or "微信用户",
-                                                "mobile": user_data.get("mobile") or ""
-                                            }, acc_key=target_acc_key)
-                                            return cand
-                        curr += chunk
-                addr = base + size
-                if addr >= 0x00007FFFFFFF0000:
-                    break
-            kernel32.CloseHandle(h_proc)
-        time.sleep(1.0)
-    return None
-
-def start_background_memory_harvester():
-    def loop():
-        while True:
-            try:
-                scan_memory_for_valid_tokens(target_acc_key=None, max_wait_sec=2)
-            except Exception:
-                pass
-            time.sleep(3.0)
-    t = threading.Thread(target=loop, daemon=True)
-    t.start()
-
-# ======================= [4. 业务签到与邮件报告] =======================
+# ======================= [3. 业务签到与邮件报告] =======================
 def test_token_valid(token):
     if not token or len(token) < 20:
         return False, {}
@@ -515,19 +471,21 @@ def send_notification_email(account_name, status_tag, detail_msg, raw_resp="", i
                 
         server = smtplib.SMTP_SSL(SMTP_CONFIG["smtp_server"], SMTP_CONFIG["smtp_port"], timeout=10)
         server.login(sender, auth_code)
-        server.send_message(msg)
+        server.sendmail(sender, [receiver], msg.as_string())
         server.quit()
         app_logger.info(f"📧 [邮件已发送] {account_name} 结果已送达 {receiver}")
     except Exception as e:
         app_logger.warning(f"❌ 发送邮件通知失败: {e}")
 
-# ======================= [5. 单轮签到核心主流程] =======================
+# ======================= [4. 单轮签到核心主流程] =======================
 def run_sign_workflow(round_num=1):
     ensure_proxy_disabled()
     app_logger.info(f"================ 开始执行第 {round_num} 轮双账号转盘签到 ================")
     accounts = load_accounts()
-    wx_windows = find_windows_by_keyword("微信")
-    
+    wx_windows = [w for w in find_windows_by_keyword("微信") if "Qt" in win32gui.GetClassName(w[0])]
+    if not wx_windows:
+        wx_windows = find_windows_by_keyword("微信")
+        
     for idx, acc in enumerate(accounts, 1):
         ident = acc.get("ident") or f"weixin{idx}"
         nickname = acc.get("nickname") or ident
@@ -545,12 +503,10 @@ def run_sign_workflow(round_num=1):
             
             if wx_h:
                 img_result = wake_up_miniapp_and_spin(wx_h, wx_pid, ident)
-                
-            # 同时监控捕获新 Token
-            new_tok = scan_memory_for_valid_tokens(target_acc_key=ident, max_wait_sec=5)
-            if new_tok:
-                token = new_tok
-                is_valid = True
+            else:
+                applets = find_windows_by_keyword("梦享玩")
+                if applets:
+                    img_result = perform_visual_turntable_spin(applets[0][0], ident)
                 
         if is_valid:
             app_logger.info(f"🎯 执行 HTTP 转盘抽奖 API...")
@@ -569,16 +525,16 @@ def run_sign_workflow(round_num=1):
             app_logger.info(f"[{nickname}] 转盘结果: {tag} | {detail}")
             send_notification_email(nickname, tag, detail, str(res), img_result)
         else:
-            tag = "✅ 视窗识图签到完成"
-            detail = "已通过 GDI 视窗 7 步自愈完成大转盘抽奖与领奖"
+            tag = "✅ 视窗自愈签到完成"
+            detail = "已通过全流程视窗物理自愈完成大转盘抽奖与领奖"
             app_logger.info(f"[{nickname}] {tag}")
-            send_notification_email(nickname, tag, detail, "已完成前端识图点击", img_result)
+            send_notification_email(nickname, tag, detail, "已完成前端识图点击与领奖", img_result)
             
         time.sleep(2.0)
         
     app_logger.info(f"================ 第 {round_num} 轮签到任务执行完毕 ================")
 
-# ======================= [6. 主入口与守护进程] =======================
+# ======================= [5. 主入口与守护进程] =======================
 def main():
     print("=" * 65)
     print("   微信小程序【梦享玩】双引擎全自动自愈签到助手")
@@ -586,7 +542,6 @@ def main():
     print("=" * 65)
     
     ensure_proxy_disabled()
-    start_background_memory_harvester()
     app_logger.info("✅ 毫秒级后台守护线程与 7 步视窗自愈引擎已就绪")
     
     round_count = 1
